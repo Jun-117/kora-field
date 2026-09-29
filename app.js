@@ -15,7 +15,7 @@ import * as CA from './capack.js';
 import * as B from './bs.js';
 import * as CAL from './cal.js';
 
-export const APP_VERSION = 'kf-v0.9.4 (2026-09-29)';
+export const APP_VERSION = 'kf-v0.9.5 (2026-09-29)';
 const ADMIN_EMAIL = 'koracarepokhara@gmail.com';
 // v0.9.3 (Jun 2026-09-29): a backup admin address — kept here only as a SHA-256 hash so the public app code does not show it. The rules hold the real list.
 const ADMIN_BACKUP_SHA256 = ['26d538c7399e96ff2b279a1ea2823fd31653cdc8290fd0e5f35ed492d1e13a17'];
@@ -2618,10 +2618,11 @@ function staffCard(u, mk) {
     ${own ? '<div class="hint">Your own account — Jun changes it.</div>' : ''}<div class="row wrap"${own ? ' hidden' : ''}>${u.role === 'staff' ? `<button class="btn" data-staffsave="${esc(u.uid)}">Save rights</button>${u.email ? `<button class="btn ghost" data-staffreset="${esc(u.email)}">📧 Password link</button>` : ''}<button class="btn ghost" data-staffrole="blocked" data-uid="${esc(u.uid)}">Block</button>` : u.role === 'blocked' ? `<button class="btn ghost" data-staffrole="staff" data-uid="${esc(u.uid)}">Unblock</button>` : `<button class="btn ok" data-staffsave="${esc(u.uid)}" data-approve="1">Approve with these rights</button><button class="btn ghost" data-staffrole="blocked" data-uid="${esc(u.uid)}">Block</button>`}</div>
   </div>`;
 }
-export function staffMatrix(users) {
-  const act = users.filter((u) => u.role === 'staff');
+export function staffMatrix(users, admins = []) {
+  const act = users.filter((u) => u.role === 'staff'); const me = String((S.user && S.user.email) || '').toLowerCase();
+  const adminRow = (nm) => `<tr><td><b>${esc(nm)}</b> <span class="pill blue">admin</span></td>${PERMS.map(() => '<td class="y">✓</td>').join('')}<td>all</td></tr>`;
   return `<div class="scroll-x"><table class="tbl matrix"><tr><th>Who</th>${PERMS.map(([k, l]) => `<th title="${esc(l)}">${esc(PERM_SHORT[k])}</th>`).join('')}<th>Areas</th></tr>
-    <tr><td><b>${esc(myName())}</b> <span class="pill blue">admin</span></td>${PERMS.map(() => '<td class="y">✓</td>').join('')}<td>all</td></tr>
+    ${adminRow(myName())}${admins.filter((u) => String(u.email || '').toLowerCase() !== me).map((u) => adminRow(u.name || u.email)).join('')}
     ${act.map((u) => { const pr = u.perms || PRESETS.office.perms; return `<tr><td><b>${esc(u.name || u.email)}</b></td>${PERMS.map(([k]) => `<td class="${pr[k] ? 'y' : 'n'}">${pr[k] ? '✓' : '·'}</td>`).join('')}<td>${pr.seeAll ? 'all' : esc((u.toles || []).join(', ') || '—')}</td></tr>`; }).join('')}</table></div>`;
 }
 async function loadUsers() {
@@ -2629,10 +2630,11 @@ async function loadUsers() {
   if (!isBoss()) { box.textContent = 'Only Jun and the deputy manage accounts.'; return; }
   try {
     const all = await fetchUsers(); const adm = await Promise.all(all.map((u) => isAdminEmail(u.email)));
+    const admins = all.filter((u, i) => adm[i]); /* v0.9.5: admin accounts (the backup address) show as admin rows — no rights card, they have every right */
     const rows = all.filter((u, i) => !adm[i]).sort((a, b) => ({ pending: 0, staff: 1, blocked: 2 }[a.role] ?? 3) - ({ pending: 0, staff: 1, blocked: 2 }[b.role] ?? 3));
     S.usersCache = rows; const mk = R.monthKey(today());
     const box2 = $('#drawer #usersBox') || $('#usersBox'); if (!box2) return;
-    box2.innerHTML = newStaffHtml() + `<div class="card"><div class="status" style="font-size:15px">Who can do what</div>${staffMatrix(rows)}</div>`
+    box2.innerHTML = newStaffHtml() + `<div class="card"><div class="status" style="font-size:15px">Who can do what</div>${staffMatrix(rows, admins)}</div>`
       + (rows.map((u) => staffCard(u, mk)).join('') || '<div class="card empty">No staff yet. Someone signs in with their email → they appear here as pending.</div>');
   } catch (e) { box.textContent = 'Could not load users: ' + (e.code || e.message); }
 }
