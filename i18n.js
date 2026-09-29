@@ -1115,6 +1115,12 @@ P.unshift(
 
 Object.assign(W, { 'Yes, leaving': ['네, 해지해요', 'हो, छोड्दै'] }); // 🔴 Nepali = draft for Tara
 
+// v0.9.4 login (🔴 Nepali = draft for Tara)
+Object.assign(W, {
+  'Remember my email': ['이메일 기억하기', 'मेरो इमेल सम्झनुहोस्'],
+  'Keep me signed in on this phone': ['이 폰에서 로그인 유지', 'यो फोनमा साइन इन राखिराख्नुहोस्'],
+  'The app never stores your password. Let the phone save it (iPhone: Passwords).': ['앱은 비밀번호를 저장하지 않아요. 폰이 저장하게 하세요 (아이폰: 암호).', 'एपले पासवर्ड राख्दैन। फोनलाई सेभ गर्न दिनुहोस् (iPhone: Passwords)।'],
+});
 const D2 = {}; for (const [en, [ko, ne]] of Object.entries(W)) { D2[en.trim()] = { ko, ne }; }
 
 function tr1(t) {

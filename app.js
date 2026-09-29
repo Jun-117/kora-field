@@ -2,7 +2,7 @@
 // Storage = Firestore offline cache (IndexedDB) + a second copy of every save (localStorage journal; photos in our own IndexedDB).
 // A save counts as "arrived" only when the server confirms it. Until then the second copy is kept and re-sent.
 import { initializeApp, deleteApp } from './vendor/firebase-app.js';
-import { getAuth, onAuthStateChanged, signInWithEmailAndPassword, signOut, sendPasswordResetEmail, createUserWithEmailAndPassword, initializeAuth, inMemoryPersistence } from './vendor/firebase-auth.js';
+import { getAuth, onAuthStateChanged, signInWithEmailAndPassword, signOut, sendPasswordResetEmail, createUserWithEmailAndPassword, initializeAuth, inMemoryPersistence, setPersistence, browserSessionPersistence, indexedDBLocalPersistence } from './vendor/firebase-auth.js';
 import {
   initializeFirestore, persistentLocalCache, persistentMultipleTabManager, CACHE_SIZE_UNLIMITED,
   collection, doc, setDoc, getDoc, getDocs, getDocFromServer, getDocsFromCache, onSnapshot, query, where,
@@ -15,7 +15,7 @@ import * as CA from './capack.js';
 import * as B from './bs.js';
 import * as CAL from './cal.js';
 
-export const APP_VERSION = 'kf-v0.9.3 (2026-09-29)';
+export const APP_VERSION = 'kf-v0.9.4 (2026-09-29)';
 const ADMIN_EMAIL = 'koracarepokhara@gmail.com';
 // v0.9.3 (Jun 2026-09-29): a backup admin address — kept here only as a SHA-256 hash so the public app code does not show it. The rules hold the real list.
 const ADMIN_BACKUP_SHA256 = ['26d538c7399e96ff2b279a1ea2823fd31653cdc8290fd0e5f35ed492d1e13a17'];
@@ -501,7 +501,7 @@ async function refreshRole() {
 async function wipePhone() {
   S.unsub.forEach((u) => u()); S.unsub = []; COLS.forEach((c) => S.D[c].clear()); bump();
   try { await terminate(db); await clearIndexedDbPersistence(db); } catch (e) {}
-  try { Object.keys(localStorage).filter((k) => k.startsWith('kf_') && k !== 'kf_lang').forEach((k) => localStorage.removeItem(k)); } catch (e) {}
+  try { Object.keys(localStorage).filter((k) => k.startsWith('kf_') && k !== 'kf_lang' && !k.startsWith('kf_login_')).forEach((k) => localStorage.removeItem(k)); } catch (e) {} /* v0.9.4: the login choices (email, remember, stay signed in) are not company data */
   try { indexedDB.deleteDatabase('kf-photos'); } catch (e) {}
   S.wiped = true; S.profile = {};
 }
@@ -1683,8 +1683,11 @@ function viewLogin() {
   return `<div style="max-width:420px;margin:0 auto"><div style="margin-top:12vh" class="stagger">
   <div style="--i:0;display:flex;align-items:center;gap:12px"><div style="width:44px;height:44px;border-radius:12px;background:radial-gradient(circle at 30% 30%,#7fe3ff,#1f6fb2 60%,#0b2a44)"></div><div><h1 style="margin:0">KORA Field</h1><div class="muted">Pokhara water service · staff app</div></div></div>
   <form class="card" id="loginForm" autocomplete="on" style="--i:1">
-    <label for="lg_email">Email</label><div class="pwbox"><input id="lg_email" name="email" type="email" autocomplete="username" inputmode="email"><div class="pwbtns"><button type="button" class="pwbtn" data-act="lgClear" data-for="lg_email" aria-label="Clear">✕</button></div></div>
+    <label for="lg_email">Email</label><div class="pwbox"><input id="lg_email" name="email" type="email" autocomplete="username" inputmode="email" value="${esc(lsGet('kf_login_email', ''))}"><div class="pwbtns"><button type="button" class="pwbtn" data-act="lgClear" data-for="lg_email" aria-label="Clear">✕</button></div></div>
     <label for="lg_pw">Password</label><div class="pwbox"><input id="lg_pw" name="pw" type="password" autocomplete="current-password"><div class="pwbtns"><button type="button" class="pwbtn" data-act="pwShow" aria-label="Show password">👁</button><button type="button" class="pwbtn" data-act="lgClear" data-for="lg_pw" aria-label="Clear">✕</button></div></div>
+    <label class="chk-line"><input type="checkbox" id="lg_remember"${lsGet('kf_login_remember', true) ? ' checked' : ''}> <span>Remember my email</span></label>
+    <label class="chk-line"><input type="checkbox" id="lg_keep"${lsGet('kf_login_keep', true) ? ' checked' : ''}> <span>Keep me signed in on this phone</span></label>
+    <div class="hint">The app never stores your password. Let the phone save it (iPhone: Passwords).</div>
     <div class="err hidden" id="lgErr"></div>
     <button class="btn" type="submit">Sign in</button>
     <button class="btn ghost" type="button" data-act="forgot">Forgot password</button>
@@ -2956,7 +2959,10 @@ document.addEventListener('submit', async (ev) => {
   ev.preventDefault(); const f = ev.target;
   if (f.id === 'loginForm') {
     const e = $('#lgErr'); e.classList.add('hidden');
-    try { await signInWithEmailAndPassword(auth, f.elements.email.value.trim(), f.elements.pw.value); }
+    const email = f.elements.email.value.trim(); const rem = !!($('#lg_remember') || {}).checked; const keep = ($('#lg_keep') || { checked: true }).checked;
+    lsSet('kf_login_remember', rem); lsSet('kf_login_keep', keep); lsSet('kf_login_email', rem ? email : '');
+    try { await setPersistence(auth, keep ? indexedDBLocalPersistence : browserSessionPersistence); } catch (err) { /* keep the default (stay signed in) */ }
+    try { await signInWithEmailAndPassword(auth, email, f.elements.pw.value); }
     catch (err) {
       const m = { 'auth/invalid-credential': 'Wrong email or password.', 'auth/network-request-failed': 'No internet. The first sign-in needs internet.', 'auth/too-many-requests': 'Too many tries. Wait a few minutes.' };
       e.textContent = m[err.code] || ('Sign-in failed: ' + err.code); e.classList.remove('hidden');
