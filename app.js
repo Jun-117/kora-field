@@ -15,7 +15,7 @@ import * as CA from './capack.js';
 import * as B from './bs.js';
 import * as CAL from './cal.js';
 
-export const APP_VERSION = 'kf-v0.9.1 (2026-09-29)';
+export const APP_VERSION = 'kf-v0.9.2 (2026-09-29)';
 const ADMIN_EMAIL = 'koracarepokhara@gmail.com';
 const firebaseConfig = {
   apiKey: 'AIzaSyB1_XMmrT6Kt7ONmtx_MXJ7ps_f0oKe3jg',
@@ -1677,8 +1677,8 @@ function viewLogin() {
   return `<div style="max-width:420px;margin:0 auto"><div style="margin-top:12vh" class="stagger">
   <div style="--i:0;display:flex;align-items:center;gap:12px"><div style="width:44px;height:44px;border-radius:12px;background:radial-gradient(circle at 30% 30%,#7fe3ff,#1f6fb2 60%,#0b2a44)"></div><div><h1 style="margin:0">KORA Field</h1><div class="muted">Pokhara water service · staff app</div></div></div>
   <form class="card" id="loginForm" autocomplete="on" style="--i:1">
-    <label for="lg_email">Email</label><input id="lg_email" name="email" type="email" autocomplete="username" inputmode="email">
-    <label for="lg_pw">Password</label><input id="lg_pw" name="pw" type="password" autocomplete="current-password">
+    <label for="lg_email">Email</label><div class="pwbox"><input id="lg_email" name="email" type="email" autocomplete="username" inputmode="email"><div class="pwbtns"><button type="button" class="pwbtn" data-act="lgClear" data-for="lg_email" aria-label="Clear">✕</button></div></div>
+    <label for="lg_pw">Password</label><div class="pwbox"><input id="lg_pw" name="pw" type="password" autocomplete="current-password"><div class="pwbtns"><button type="button" class="pwbtn" data-act="pwShow" aria-label="Show password">👁</button><button type="button" class="pwbtn" data-act="lgClear" data-for="lg_pw" aria-label="Clear">✕</button></div></div>
     <div class="err hidden" id="lgErr"></div>
     <button class="btn" type="submit">Sign in</button>
     <button class="btn ghost" type="button" data-act="forgot">Forgot password</button>
@@ -2892,6 +2892,8 @@ document.addEventListener('click', async (ev) => {
   else if (act === 'locAsk') locAsk();
   else if (act === 'gps') captureGps(a.closest('form'));
   else if (act === 'cam' || act === 'gal') { const ins = a.closest('.fld').querySelectorAll('.photoIn'); (act === 'cam' ? ins[0] : ins[1]).click(); }
+  else if (act === 'pwShow') { const p = $('#lg_pw'); const show = p.type === 'password'; p.type = show ? 'text' : 'password'; a.textContent = show ? '🙈' : '👁'; a.setAttribute('aria-label', show ? 'Hide password' : 'Show password'); p.focus(); }
+  else if (act === 'lgClear') { const el = document.getElementById(a.dataset.for); if (el) { el.value = ''; el.focus(); } }
   else if (act === 'forgot') {
     const email = $('#lg_email').value.trim(); const e = $('#lgErr');
     if (!email) { e.textContent = 'Type your email first.'; e.classList.remove('hidden'); return; }

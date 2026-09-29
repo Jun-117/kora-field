@@ -695,3 +695,10 @@ body.tv .side { display:none; } body.tv .shell { grid-template-columns: 1fr !imp
 /* change log (v0.8 security) */
 .tbl.chg td:last-child { font-size:13px; }
 .chg-money b { color:var(--warn); }
+
+/* v0.9.2 login: show the password · clear a field in one tap */
+.pwbox { position:relative; }
+.pwbox input { padding-right:92px; }
+.pwbtns { position:absolute; right:6px; top:50%; transform:translateY(-50%); display:flex; gap:2px; }
+.pwbtn { border:0; background:transparent; font-size:18px; line-height:1; padding:8px; min-width:40px; min-height:40px; border-radius:10px; color:var(--muted); cursor:pointer; }
+.pwbtn:active { background:var(--line2); }
