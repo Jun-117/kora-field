@@ -15,8 +15,14 @@ import * as CA from './capack.js';
 import * as B from './bs.js';
 import * as CAL from './cal.js';
 
-export const APP_VERSION = 'kf-v0.9.2 (2026-09-29)';
+export const APP_VERSION = 'kf-v0.9.3 (2026-09-29)';
 const ADMIN_EMAIL = 'koracarepokhara@gmail.com';
+// v0.9.3 (Jun 2026-09-29): a backup admin address — kept here only as a SHA-256 hash so the public app code does not show it. The rules hold the real list.
+const ADMIN_BACKUP_SHA256 = ['26d538c7399e96ff2b279a1ea2823fd31653cdc8290fd0e5f35ed492d1e13a17'];
+export async function isAdminEmail(email) {
+  const e = String(email || '').trim().toLowerCase(); if (!e) return false; if (e === ADMIN_EMAIL) return true;
+  try { const d = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(e)); return ADMIN_BACKUP_SHA256.includes([...new Uint8Array(d)].map((b) => b.toString(16).padStart(2, '0')).join('')); } catch (err) { return false; }
+}
 const firebaseConfig = {
   apiKey: 'AIzaSyB1_XMmrT6Kt7ONmtx_MXJ7ps_f0oKe3jg',
   authDomain: 'kora-field.firebaseapp.com',
@@ -469,7 +475,7 @@ onAuthStateChanged(auth, async (user) => {
   S.unsub.forEach((u) => u()); S.unsub = []; COLS.forEach((c) => S.D[c].clear()); bump();
   S.user = user;
   if (!user) { S.role = null; render(); return; }
-  S.isAdmin = (user.email || '').toLowerCase() === ADMIN_EMAIL;
+  S.isAdmin = await isAdminEmail(user.email);
   if (S.isAdmin && lsGet('kf_lang', null) === null) setLang('ko');
   S.role = S.isAdmin ? 'admin' : lsGet('kf_role_' + user.uid, null);
   S.profile = lsGet('kf_prof_' + user.uid, {}); S.isDeputy = !S.isAdmin && !!(S.profile && S.profile.role === 'staff' && S.profile.deputy === true);
@@ -2619,7 +2625,8 @@ async function loadUsers() {
   const box = $('#drawer #usersBox') || $('#usersBox'); if (!box) return;
   if (!isBoss()) { box.textContent = 'Only Jun and the deputy manage accounts.'; return; }
   try {
-    const rows = (await fetchUsers()).filter((u) => String(u.email || '').toLowerCase() !== ADMIN_EMAIL).sort((a, b) => ({ pending: 0, staff: 1, blocked: 2 }[a.role] ?? 3) - ({ pending: 0, staff: 1, blocked: 2 }[b.role] ?? 3));
+    const all = await fetchUsers(); const adm = await Promise.all(all.map((u) => isAdminEmail(u.email)));
+    const rows = all.filter((u, i) => !adm[i]).sort((a, b) => ({ pending: 0, staff: 1, blocked: 2 }[a.role] ?? 3) - ({ pending: 0, staff: 1, blocked: 2 }[b.role] ?? 3));
     S.usersCache = rows; const mk = R.monthKey(today());
     const box2 = $('#drawer #usersBox') || $('#usersBox'); if (!box2) return;
     box2.innerHTML = newStaffHtml() + `<div class="card"><div class="status" style="font-size:15px">Who can do what</div>${staffMatrix(rows)}</div>`
