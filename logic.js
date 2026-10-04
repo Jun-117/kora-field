@@ -21,14 +21,10 @@ export const FCL = { leadTimeWeeks: 13, minBills: 30, minCollection: 0.6 };
 // Direction gate (memory kora-direction-gate): churn > 3.5%/month · 90-day retention < 85% · collection < 50%.
 // Sample needs: churn 600 household-months; collection ~220 household-months (10σ between 90% and 50%).
 export const GATE = { churnMonthly: 0.035, retention90: 0.85, collection: 0.5, churnExposure: 600, collectionExposure: 220, retentionMinCohort: 30 };
-// Onboarding: G-1 §3-1 day-7 happy call; plan §4 #7 check-ins at 7/30/60/90 days.
+// Calls: one call 7 days after the install (G-1 §3-1). Jun 2026-09-30: no day-30/60/90 check-ins, no quarterly call, no random call — visits cover those months.
 export const ONBOARD = [
-  { k: 'D7', days: 7, label: 'Day 7 happy call' },
-  { k: 'D30', days: 30, label: 'Day 30 check-in' },
-  { k: 'D60', days: 60, label: 'Day 60 check-in' },
-  { k: 'D90', days: 90, label: 'Day 90 check-in' },
+  { k: 'D7', days: 7, label: 'Day-7 call' },
 ];
-export const QUARTER_CALL_DAYS = 91; // G-1 §3-2: every 3 months
 
 // ---------- dates ----------
 const pad = (n) => String(n).padStart(2, '0');
@@ -193,7 +189,7 @@ export const DUNNING = [
   { stage: 'due', label: 'Due today — afternoon re-reminder', short: 'Due today', color: 'yellow' },
   { stage: 'late', label: 'Late 1–2 days — re-remind', short: 'Late', color: 'yellow' },
   { stage: 'call', label: 'Late 3–6 days — Tara calls', short: 'Call', color: 'orange' },
-  { stage: 'visit', label: 'Late 7+ days — home visit (contract §2.7)', short: 'Visit', color: 'red' },
+  { stage: 'visit', label: 'Late 7+ days — home visit', short: 'Visit', color: 'red' },
 ];
 export function dunning(led, today) {
   const b = led.bills.find((x) => x.status !== 'paid' && x.due <= addDays(today, 3)) || (led.nextBill && led.nextBill.due <= addDays(today, 3) ? led.nextBill : null);
@@ -454,7 +450,7 @@ export function dashainBonus(person, onDate) {
 // 🚨 Our own check only (memory kora-uv-disinfection-decision.md:137): never tell a customer the water is safe or unsafe from it — only a lab result is said out loud.
 // ENPHO before/after test needs raw water with E. coli (:75–76) · municipal water (the UV module works below hardness 120 mg/L — kora-uv-6w-verdict-2026-09-22.md:32;
 // bore wells in central Pokhara measured 300–320 — kora-pokhara-water-sources-2026-09-25.md) · within 30 days of the install (PI condition 4 — kora-uv-disinfection-decision.md:78).
-export const VIAL_RESULTS = ['Blue — E. coli', 'Pink — coliforms', 'No change', 'Spoiled — redo'];
+export const VIAL_RESULTS = ['Black — faecal contamination', 'No change', 'Spoiled — redo']; // P/A (H2S) vial from ENPHO (ECC discontinued, 2026-09-30) · black after ~48 h at room temperature
 export const VIAL = { target: 25, enphoDays: 30, readAfterDays: 2 };
 // 95% range for a share (Wilson) — honest about small samples
 export function wilson(k, n, z = 1.96) {
@@ -463,11 +459,11 @@ export function wilson(k, n, z = 1.96) {
 }
 export function vialStats(tests, customers, today) {
   const byC = new Map((customers || []).map((c) => [c.id, c])); const all = tests || [];
-  const read = all.filter((t) => t.result && t.result !== VIAL_RESULTS[3]); const pos = read.filter((t) => t.result === VIAL_RESULTS[0]);
+  const read = all.filter((t) => t.result && t.result !== VIAL_RESULTS[2]); const pos = read.filter((t) => t.result === VIAL_RESULTS[0]);
   const group = (keyOf) => { const g = {}; for (const t of read) { const k = keyOf(byC.get(t.customerId) || {}) || 'Unknown'; const r = (g[k] = g[k] || { n: 0, pos: 0 }); r.n++; if (t.result === VIAL_RESULTS[0]) r.pos++; } return g; };
   const enpho = pos.map((t) => ({ t, c: byC.get(t.customerId) })).filter((x) => x.c && x.c.status === 'Active' && x.c.waterSource === 'Municipal tap' && isDate(x.c.installDate) && daysBetween(x.c.installDate, today) <= VIAL.enphoDays)
     .map((x) => ({ ...x, until: addDays(x.c.installDate, VIAL.enphoDays) }));
-  return { started: all.length, n: read.length, pos: pos.length, coliforms: read.filter((t) => t.result === VIAL_RESULTS[1]).length, rate: read.length ? pos.length / read.length : null, ci: wilson(pos.length, read.length),
+  return { started: all.length, n: read.length, pos: pos.length, rate: read.length ? pos.length / read.length : null, ci: wilson(pos.length, read.length),
     waiting: all.filter((t) => !t.result), toRead: all.filter((t) => !t.result && isDate(t.sampledDate) && daysBetween(t.sampledDate, today) >= VIAL.readAfterDays), bySource: group((c) => c.waterSource), byTole: group((c) => c.tole === 'Other' ? c.toleOther : c.tole), enpho };
 }
 export function chaseStats(checkins, payments, from, today) {
@@ -505,6 +501,23 @@ export function suggestNextVisit(installDate, visitDate) {
 // PP interval: 3 months if the 3-month mark lands in the monsoon (Jun–Sep), else 4 (E-2).
 export function ppMonths(lastChange) { const m = parseD(addMonths(lastChange, PP_MONSOON_MONTHS)).getMonth() + 1; return m >= 6 && m <= 9 ? PP_MONSOON_MONTHS : FILTER_MONTHS.PP; }
 
+// v0.14 (Jun 10/3 #3): once a filter type has 5+ observed changes across all homes, its booking interval becomes the observed average (rounded to a month, 1..36)
+export const LEARN_MIN = 5;
+export function learnedMonths(customers, visits, on = true) {
+  const out = { ...FILTER_MONTHS }; if (!on) return out;
+  for (const r of filterLearning(customers, visits)) { if (r.n >= LEARN_MIN && r.avgMonths && FILTER_MONTHS[r.type]) out[r.type] = Math.max(1, Math.min(36, Math.round(r.avgMonths))); }
+  return out;
+}
+// v0.15 filters-together (Jun 10/3 "모든 필터 한번에 해야지 pp 따로 cto 따로 이건 아닌듯"): one filter visit, not one per filter.
+// The next change = the earliest due filter; every filter that would fall due before the change after that goes in on the same visit.
+export function filterBatch(fd, months = FILTER_MONTHS) {
+  const real = (fd || []).filter((f) => f.due && f.type !== 'Sanitise' && (months[f.type] || FILTER_MONTHS[f.type]));
+  if (!real.length) return null;
+  const first = real.slice().sort((a, b) => String(a.due).localeCompare(String(b.due)))[0];
+  const horizon = addMonths(first.due, months[first.type] || FILTER_MONTHS[first.type]);
+  const types = FILTER_TYPES.filter((t) => real.some((f) => f.type === t && f.due < horizon));
+  return { date: first.due, types, horizon, status: first.status, lead: first.type };
+}
 export function filterDues(customer, cVisits, today, months = FILTER_MONTHS) {
   const res = [];
   if (!customer || !isDate(customer.installDate)) return res;
@@ -553,10 +566,6 @@ export function onboarding(customer, checkins, today) {
     const done = mine.find((x) => x.kind === o.k);
     return { ...o, due, done: done || null, status: done ? 'done' : due > today ? 'future' : daysBetween(due, today) > 3 ? 'overdue' : 'due' };
   });
-  const calls = mine.filter((x) => x.kind === 'Quarterly call' || x.kind === 'D90').map((x) => x.date).sort();
-  const base = calls.length ? calls[calls.length - 1] : addDays(customer.installDate, 90);
-  const qDue = addDays(base, QUARTER_CALL_DAYS);
-  rows.push({ k: 'Q', label: 'Quarterly happy call', due: qDue, done: null, status: qDue > today ? 'future' : 'due' });
   return rows;
 }
 
@@ -574,19 +583,22 @@ export function requestSla(receivedMs, isHoliday = (d) => d.getDay() === 6) {
 }
 
 // ---------- referrals: G-1 §4 ----------
-// Referee: first month free (at sign-up). Referrer: one month free 3 months after the referee signed up,
-// only once the referee is installed and the install fee is paid (§4-2).
-export function referralRewards(customers, payments, ledgers, today) {
-  const out = [];
+// v0.15 (Jun 10/3): only during a campaign, only the referrer — half a month off a bill, 3 months after the new home signed up,
+// and only once that home is installed and its install fee is paid (§4-2). The new home gets nothing (G-1 §4 to update).
+export const REFERRAL_SHARE = 0.5; /* v0.15: the referrer gets half a month off (Tara 10/3 "한 달 무료는 너무 퍼주는거" → Jun "50% 추천인 쿠폰") */
+export const referralAmount = () => Math.round(PRICES.monthly * REFERRAL_SHARE);
+// on = Settings "Referral campaign" — off (the default) means no rewards, no card, no page: the campaign is switched on only when installs slow down (Jun 10/3)
+export function referralRewards(customers, payments, ledgers, today, on = true) {
+  const out = []; if (!on) return out;
   const byId = new Map(customers.map((c) => [c.id, c]));
   const credited = (cid, forId) => payments.some((p) => p.type === 'Referral credit' && p.customerId === cid && p.referralFor === forId);
   for (const c of customers) {
     if (!c.referrerId || !byId.has(c.referrerId)) continue;
     const r = byId.get(c.referrerId); const led = ledgers.get(c.id);
     const feePaid = !!(led && led.paidThrough >= 1);
-    out.push({ who: c, forId: c.id, role: 'referee', due: c.signUpDate || c.installDate, amount: PRICES.monthly, ready: true, done: credited(c.id, c.id) });
+    /* v0.15: only the referrer is rewarded (50% of a month); the new customer's own free month is gone */
     const due = addMonths(c.signUpDate || c.installDate, 3);
-    out.push({ who: r, forId: c.id, role: 'referrer', due, amount: PRICES.monthly, ready: feePaid && due <= today, waiting: !feePaid ? 'install fee not paid yet' : due > today ? `from ${due}` : '', done: credited(r.id, c.id) });
+    out.push({ who: r, forId: c.id, role: 'referrer', due, amount: referralAmount(), ready: feePaid && due <= today, waiting: !feePaid ? 'install fee not paid yet' : due > today ? `from ${due}` : '', done: credited(r.id, c.id) });
   }
   return out;
 }
@@ -711,8 +723,9 @@ export function parseCSV(text) {
   return rows.filter((r) => r.some((c) => String(c).trim() !== ''));
 }
 // #2 bank statement matching — finds the customer by KC code or phone digits in the description; else by a unique exact amount.
-export function matchBankRows(rows, map, customers, ledgers) {
+export function matchBankRows(rows, map, customers, ledgers, payments) {
   const num = (s) => Number(String(s).replace(/[^\d.-]/g, ''));
+  const pays = payments || [];
   return rows.map((r, i) => {
     const desc = String(r[map.desc] ?? ''); const amount = num(r[map.amount]); const date = normBankDate(r[map.date]);
     let cand = null, how = '';
@@ -720,7 +733,8 @@ export function matchBankRows(rows, map, customers, ledgers) {
     if (code) { cand = customers.find((c) => c.code === code[0]); how = cand ? 'KC code' : ''; }
     if (!cand) { const digits = desc.replace(/\D/g, ''); cand = customers.find((c) => c.phone && digits.includes(c.phone.slice(-10))); how = cand ? 'phone' : ''; }
     if (!cand && amount > 0) { const hits = customers.filter((c) => { const l = ledgers.get(c.id); return l && (l.overdue === amount || (l.nextBill && l.nextBill.amount - l.nextBill.paid === amount)); }); if (hits.length === 1) { cand = hits[0]; how = 'amount (unique)'; } }
-    return { i, date, amount, desc, customer: cand, how };
+    const dup = cand && date ? pays.some((p) => p.customerId === cand.id && Math.abs((Number(p.amount) || 0) - amount) < 0.5 && isDate(p.date) && Math.abs(daysBetween(p.date, date)) <= 3) : false; /* v0.11.1 (#15): same home · same amount · within 3 days = already in the book */
+    return { i, date, amount, desc, customer: cand, how, dup };
   });
 }
 function normBankDate(s) {
@@ -1014,7 +1028,7 @@ export function watchScore(x, ctx, today) {
   const fo = x.fd.filter((f) => f.status === 'overdue' && f.type !== 'Sanitise'); if (fo.length) add('filter', 'service', '🧪', `filter overdue: ${fo.map((f) => f.type).join(', ')}`, 'visit');
   // life stage
   if (isDate(c.installDate) && daysBetween(c.installDate, today) <= WATCH.newDays) add('new', 'stage', '🌱', `first 90 days (day ${daysBetween(c.installDate, today)})`, 'call');
-  const obLate = x.ob.filter((o) => o.status === 'overdue' && o.k !== 'Q'); if (obLate.length) add('ob', 'stage', '📞', `${obLate.map((o) => o.k).join(', ')} call overdue`, 'call');
+  const obLate = x.ob.filter((o) => o.status === 'overdue'); if (obLate.length) add('ob', 'stage', '📞', 'day-7 call overdue', 'call');
   const mv = (ctx.rel.get(c.id) || []).find((r) => ['Requested', 'Scheduled'].includes(r.status)); if (mv) add('move', 'stage', '🚚', `moving ${mv.moveDate || ''}`.trim(), 'relocation');
   if (led.contractEnded) add('contract', 'stage', '📝', 'contract ended — renew', 'call');
   if (x.status === 'Paused') add(isDate(c.pausedUntil) && c.pausedUntil < today ? 'pauseEnd' : 'paused', 'stage', '⏸️', isDate(c.pausedUntil) && c.pausedUntil < today ? `pause ended ${c.pausedUntil} — restart?` : 'paused', 'call');
@@ -1039,6 +1053,12 @@ export const LEAVE_REASONS = ['Moved away (outside our area)', 'Money — cannot
 export const medianOf = (list) => { const a = list.filter(Number.isFinite).slice().sort((x, y) => x - y); const n = a.length; return n ? (n % 2 ? a[(n - 1) / 2] : (a[n / 2 - 1] + a[n / 2]) / 2) : null; };
 export const LATE_REASONS = ['Money not come in yet', 'No money this month', 'Forgot', 'Unhappy — held back', 'Other'];
 export const TENURE_BUCKETS = [[0, 2, '0–3 months'], [3, 5, '3–6 months'], [6, 11, '6–12 months'], [12, 23, '12–24 months'], [24, 1e9, '24+ months']];
+// v0.16 (outside-view #20 → Jun 10/3 ㄱㄱ): what getting the devices back costs — the cost field on the recovery case was asked and never shown
+export function recoveryCost(recoveries) {
+  const rs = (recoveries || []).filter((r) => Number(r.costNpr) > 0); const total = rs.reduce((s, r) => s + Number(r.costNpr), 0);
+  const back = (recoveries || []).filter((r) => r.outcome === 'Recovered' || r.outcome === 'Partial').length;
+  return { cases: (recoveries || []).length, withCost: rs.length, total: Math.round(total), perCase: rs.length ? Math.round(total / rs.length) : null, back };
+}
 export function leaverStats(customers, recoveries, today, p = PRICES) {
   const rec = new Map(); for (const r of recoveries || []) { const o = rec.get(r.customerId); if (!o || String(r.startedDate || '') > String(o.startedDate || '')) rec.set(r.customerId, r); }
   const rows = customers.filter((c) => c.status === 'Churned' && isDate(c.installDate)).map((c) => {
@@ -1343,7 +1363,7 @@ export function approvalQueue(D) {
 // ---------- dispatch ----------
 // Who goes to a home: a cover (another person until a date, e.g. someone is sick) beats the regular assignee.
 export const assigneeOf = (c, today) => (c && c.cover && c.cover.to && c.cover.until >= today ? c.cover.to : (c && c.assignee) || '');
-export function pickRandom(list, n) {
+export function pickRandom(list, n) { /* kept for tests · the random happy call was dropped (Jun 2026-09-30) */
   const a = list.slice(); const r = new Uint32Array(a.length); (globalThis.crypto || { getRandomValues: (x) => x.map(() => Math.random() * 2 ** 32) }).getRandomValues(r);
   for (let i = a.length - 1; i > 0; i--) { const j = r[i] % (i + 1); [a[i], a[j]] = [a[j], a[i]]; }
   return a.slice(0, n);

@@ -1,8 +1,9 @@
 // KORA Field — today's route on a map (phone). Numbered stops like a delivery app: visits due, 7+ day collections
 // (home visit, G-1 §1-3), open repairs; done today = green.
 // Order: AUTO (default) = nearest-neighbour from where you stand + 2-opt, redone as you move (live position).
-//        MANUAL = your own order (▲▼ / 📌 in the list); "Auto" switches back. Both are kept per day on the phone.
+//        MANUAL = your own order (hold ☰ and drag a stop, or 📌 it next — v0.11); "Auto" switches back. Both are kept per day on the phone.
 import * as R from './logic.js';
+import { nextText } from './app.js';
 import { S, model, esc, custLabel, toleOf, waLink, dunText, nav, toast, today, offerLink, omwBtn, omwChips, can } from './app.js';
 import { loadLeaflet, MAP_OPTS, setHere, hereNow, openDirections, dirUrl } from './geo.js';
 
@@ -13,6 +14,8 @@ const KIND = {
   done: { cls: 'done', label: 'Done today', color: '#16a34a' },
 };
 let Lf = null, map = null, layer = null, meLayer = null, me = null, filter = 'all', lastView = null, watchId = null, orderedAt = null;
+// v0.11.2 (#7) Jun: "마커들 누르면 순서대로 1,2,3 뜨게" — tap pins in the order you want; each tap puts that stop at the next position of your own order
+let picking = false, picked = [];
 const dayKey = () => 'kf_route_' + today();
 const modeKey = () => 'kf_route_mode_' + today();
 const LIVE_REORDER_KM = 0.15; // re-order after moving 150 m (auto mode)
@@ -79,10 +82,10 @@ export function routeHtml() {
     <div class="rtop">
       <div class="rsum">${chips.map(([k, l, c, col]) => `<span class="k ${filter === k ? 'on' : ''}" data-rfilter="${k}" style="color:${col}"><b>${c}</b>${l}</span>`).join('')}
         <span class="k" data-list="calls" style="color:var(--c-call)"><b>${calls}</b>Calls</span><span class="k" data-list="collections" style="color:var(--c-money)"><b>${chase}</b>To chase</span></div>
-      <div class="rmode">${routeMode() === 'auto' ? `<span class="on">📡 Auto order · from where you are${me ? '' : ' (finding you…)'}</span>` : `<span class="man">✋ Your own order</span><button data-act="rAuto">📡 Back to auto</button>`}</div>
+      <div class="rmode">${routeMode() === 'auto' ? `<span class="on">📡 Auto order · from where you are${me ? '' : ' (finding you…)'}</span><button data-act="rPick" class="${picking ? 'on' : ''}">${picking ? `👆 ${picked.length} picked · done` : '✋ Your own order · tap the pins'}</button>` : `<span class="man">✋ Your own order</span><button data-act="rAuto">📡 Back to auto</button><button data-act="rPick" class="${picking ? 'on' : ''}">${picking ? `👆 ${picked.length} picked · done` : '👆 Tap pins to re-order'}</button>`}</div>
       ${st.noGps.length ? `<div class="rsum" style="font-size:12px;color:var(--muted)">📍 ${st.noGps.length} stop(s) without GPS — open the customer and tap “Get location” next visit</div>` : ''}
     </div>
-    <div class="rbot"><button data-act="rList">✋ Order</button><button class="primary" data-act="rNext" id="rNext">🧭 Next</button><button class="round" data-act="rMe" title="My location">📍</button><button class="round" data-act="rList" title="List">☰</button></div>
+    <div class="rbot"><button data-act="rTomorrow" title="Tomorrow's homes — send the notice">📅</button><button data-act="rList">✋ Order</button><button class="primary" data-act="rNext" id="rNext"><span class="nx">🧭 Next</span></button><button class="round" data-act="rMe" title="My location">📍</button></div>
   </div>`;
 }
 export async function mountRoute(root) {
@@ -96,6 +99,7 @@ export async function mountRoute(root) {
   const lab = () => box.classList.toggle('labels', map.getZoom() >= 15); map.on('zoomend', lab);
   map.on('click', () => closeSheet());
   draw(true); lab();
+  if (!navigator.onLine) { toast('📵 Offline — the map tiles cannot load. The stop list still works.', 5000); setTimeout(() => listSheet(), 400); } /* v0.11.1 (#17) */
   if (!me && hereNow()) me = hereNow();
   startWatch();
 }
@@ -124,12 +128,12 @@ function draw(fit) {
     const k = s.done ? 'done' : s.main; const n = num.get(s.id);
     const html = `<div class="stop-pin ${KIND[k].cls} ${k === 'collect' ? 'pulse' : ''}"><div class="b"><span>${s.done ? '✓' : n || '•'}</span></div><div class="lab">${esc((s.x.c.name || '').split(' ')[0])} · ${esc(toleOf(s.x.c))}</div></div>`;
     const mk = Lf.marker([g.lat, g.lng], { icon: Lf.divIcon({ className: '', html, iconSize: [34, 34], iconAnchor: [17, 34] }), zIndexOffset: s.done ? 0 : 1000 - (n || 0) });
-    mk.on('click', () => sheet(s, n));
+    mk.on('click', () => { if (picking) { pickStop(s.id); return; } sheet(s, n); });
     layer.addLayer(mk);
   }
   if (seq.length > 1 && filter === 'all') Lf.polyline(seq.map((s) => [s.p.lat, s.p.lng]), { color: '#1f6fb2', weight: 3, opacity: 0.45, dashArray: '6 8' }).addTo(layer);
   const nx = document.getElementById('rNext'); const first = seq[0];
-  if (nx) nx.innerHTML = first ? `🧭 Next: #1 ${esc((first.x.c.name || '').split(' ')[0])}` : '🧭 Nothing left';
+  if (nx) nx.innerHTML = first ? `<span class="nx">🧭 Next</span><span class="nxn">#1 ${esc((first.x.c.name || '').split(' ')[0])}</span>` : '<span class="nx">🧭 Nothing left</span>'; /* v0.11.1: two short lines instead of one clipped line */
   if (fit) { if (lastView) map.setView(lastView.c, lastView.z, { animate: false }); else if (pts.length) map.fitBounds(pts, { padding: [70, 70], maxZoom: 16, animate: false }); else map.setView([28.2096, 83.9856], 13, { animate: false }); }
   drawMe();
   S.routeSeq = seq; // for tests & the list
@@ -155,7 +159,7 @@ function sheet(s, n) {
     </div>${can('visit') ? omwChips(c) : ''}`;
   document.body.appendChild(el);
 }
-export function closeSheet() { const el = document.getElementById('rsheet'); if (el) el.remove(); }
+export function closeSheet() { const el = document.getElementById('rsheet'); if (!el) return; el.id = ''; el.classList.add('out'); setTimeout(() => el.remove(), 230); } /* v0.11.1: slides down instead of vanishing (the id is freed at once so the next sheet can mount) */
 function listSheet(keep) {
   const old = document.getElementById('rsheet'); const scroll = old && keep ? old.querySelector('.rl').scrollTop : 0;
   if (keep && !(old && old.classList.contains('list'))) return;
@@ -165,9 +169,9 @@ function listSheet(keep) {
   el.innerHTML = `<div class="grab" data-act="rClose"></div><button class="sx" data-act="rClose" title="Close">✕</button>
     <div class="rl-h"><b style="font-size:18px">Today's order</b> <span class="muted">${seq.length} stops · ≈${total.toFixed(1)} km straight-line</span></div>
     <div class="rl-mode">${auto ? '<span class="on">📡 Auto — redone from where you are as you move</span>' : '<span class="man">✋ Your own order</span><button class="btn small ghost" data-act="rAuto">📡 Back to auto</button>'}</div>
-    <div class="muted" style="font-size:12px;margin:4px 0 8px">▲▼ move a stop · 📌 go there next · tap a name to open. Changing the order switches to your own order.</div>
-    <div class="card flush rl">${seq.map((s, i) => `<div class="item rl-i"><span class="pill blue">#${i + 1}</span><div class="main" data-cust="${esc(s.id)}"><div class="t">${esc(s.x.c.name)}</div><div class="s">${esc(toleOf(s.x.c))} · ${s.why.map(esc).join(' · ')}</div></div>
-      <div class="ord"><button data-rmove="${esc(s.id)}|-1" ${i === 0 ? 'disabled' : ''} title="Up">▲</button><button data-rmove="${esc(s.id)}|1" ${i === seq.length - 1 ? 'disabled' : ''} title="Down">▼</button><button data-rnext="${esc(s.id)}" ${i === 0 ? 'disabled' : ''} title="Go there next">📌</button></div></div>`).join('') || '<div class="empty">No stops</div>'}</div>`;
+    <div class="muted" style="font-size:12px;margin:4px 0 8px">Hold ☰ and drag a stop to where you want it · 📌 go there next · tap a name to open. Changing the order switches to your own order.</div>
+    <div class="card flush rl">${seq.map((s, i) => `<div class="item rl-i" data-rid="${esc(s.id)}"><span class="pill blue">#${i + 1}</span><div class="main" data-cust="${esc(s.id)}"><div class="t">${esc(s.x.c.name)}</div><div class="s">${esc(toleOf(s.x.c))} · ${s.why.map(esc).join(' · ')}</div></div>
+      <div class="ord"><button data-rnext="${esc(s.id)}" ${i === 0 ? 'disabled' : ''} title="Go there next">📌</button><button class="rdrag" data-rdrag="${esc(s.id)}" title="Hold and drag">☰</button></div></div>`).join('') || '<div class="empty">No stops</div>'}</div>`;
   document.body.appendChild(el);
   if (scroll) el.querySelector('.rl').scrollTop = scroll;
 }
@@ -177,16 +181,64 @@ function moveStop(id, d) {
   if (i < 0 || j < 0 || j >= ids.length || i === j) return;
   ids.splice(j, 0, ids.splice(i, 1)[0]); setManual(ids); update(); listSheet(true);
 }
+// v0.11 drag to reorder (Jun 2026-09-30 "꾹 누르면 위로 원하는만큼"): hold a row's ☰ (≈0.3 s), drag it up or down as far as you like, let go → your own order.
+// Pointer Events, so a mouse on the PC does the same. The list scrolls by itself near its top and bottom edges.
+let drag = null;
+const dragRows = () => [...document.querySelectorAll('#rsheet .rl-i')];
+document.addEventListener('pointerdown', (ev) => {
+  const h = ev.target.closest('[data-rdrag]'); if (!h || drag) return;
+  ev.preventDefault(); const row = h.closest('.rl-i'); const list = row.parentElement;
+  drag = { id: h.dataset.rdrag, row, list, h, y0: ev.clientY, s0: list.scrollTop, pid: ev.pointerId, live: false, before: '', timer: 0 };
+  drag.timer = setTimeout(() => { if (!drag) return; drag.live = true; row.classList.add('lifting'); try { h.setPointerCapture(drag.pid); } catch (e) {} }, 300);
+});
+document.addEventListener('pointermove', (ev) => {
+  if (!drag || ev.pointerId !== drag.pid) return;
+  if (!drag.live) { if (Math.abs(ev.clientY - drag.y0) > 8) { clearTimeout(drag.timer); drag = null; } return; } /* moved before the hold → it was a scroll */
+  ev.preventDefault(); const { row, list } = drag;
+  const lr = list.getBoundingClientRect(); if (ev.clientY < lr.top + 24) list.scrollTop -= 8; else if (ev.clientY > lr.bottom - 24) list.scrollTop += 8;
+  row.style.transform = `translateY(${ev.clientY - drag.y0 + (list.scrollTop - drag.s0)}px)`;
+  const mid = row.getBoundingClientRect().top + row.offsetHeight / 2; const rows = dragRows().filter((r) => r !== row);
+  const before = rows.find((r) => mid < r.getBoundingClientRect().top + r.offsetHeight / 2) || null;
+  rows.forEach((r) => r.classList.toggle('drop-before', r === before)); list.classList.toggle('drop-end', !before); drag.before = before ? before.dataset.rid : '';
+});
+function endDrag(ev) {
+  if (!drag || (ev && ev.pointerId !== undefined && ev.pointerId !== drag.pid)) return;
+  clearTimeout(drag.timer); const d = drag; drag = null;
+  d.row.classList.remove('lifting'); d.row.style.transform = ''; dragRows().forEach((r) => r.classList.remove('drop-before')); d.list.classList.remove('drop-end');
+  if (!d.live) return;
+  const ids = (S.routeSeq || []).map((s) => s.id); const i = ids.indexOf(d.id); if (i < 0) return; ids.splice(i, 1);
+  const j = d.before ? ids.indexOf(d.before) : -1; ids.splice(j < 0 ? ids.length : j, 0, d.id);
+  setManual(ids); update(); listSheet(true);
+}
+document.addEventListener('pointerup', endDrag); document.addEventListener('pointercancel', endDrag);
+function pickStop(id) {
+  if (picked.includes(id)) return;
+  picked.push(id); const ids = (S.routeSeq || []).map((s) => s.id).filter((x) => !picked.includes(x)); setManual([...picked, ...ids]); update();
+  const all = (S.routeSeq || []).length; if (picked.length >= all) { picking = false; picked = []; toast('✋ Order set'); update(); } else toast(`#${picked.length} · tap the next stop (${all - picked.length} left)`, 1500);
+}
+// v0.14 (#4 · Jun 10/3): the evening-before notice — tomorrow's homes, one WhatsApp link each; a tap marks it sent on this phone
+function tomorrowSheet() {
+  closeSheet(); const m = model(); const tm = R.addDays(m.t, 1);
+  const homes = [...m.cust.values()].filter((x) => x.status === 'Active' && x.nv && x.nv.date === tm);
+  const sentKey = 'kf_next_' + tm; const sent = lsGet(sentKey, {});
+  const el = document.createElement('div'); el.className = 'sheet list'; el.id = 'rsheet';
+  el.innerHTML = `<div class="grab" data-act="rClose"></div><button class="sx" data-act="rClose" title="Close">✕</button>
+    <div class="rl-h"><b>📅 Tomorrow · ${esc(tm)}</b><span class="muted">${homes.length} home${homes.length === 1 ? '' : 's'} · tap 💬 to send the notice</span></div>
+    <div class="rl">${homes.map((x) => `<div class="rl-i"><div class="main"><b>${esc(x.c.name)}</b> <span class="mono">${esc(x.c.code)}</span><div class="muted">${esc(x.c.tole || '')} · ${esc(x.nv.source || 'visit')}</div></div>${x.c.phone ? `<a class="btn small ${sent[x.c.id] ? 'ghost' : 'ok'}" href="${esc(waLink(x.c.phone, nextText(x.c, tm)))}" target="_blank" rel="noopener" data-next-sent="${esc(x.c.id)}">${sent[x.c.id] ? '✓ sent' : '💬 Notice'}</a>` : '<span class="muted">no phone</span>'}</div>`).join('') || '<div class="empty">Nothing planned for tomorrow</div>'}</div>`;
+  document.body.appendChild(el);
+}
+document.addEventListener('click', (ev) => { const b = ev.target.closest && ev.target.closest('[data-next-sent]'); if (!b) return; const m = model(); const tm = R.addDays(m.t, 1); const k = 'kf_next_' + tm; const s = lsGet(k, {}); s[b.dataset.nextSent] = Date.now(); lsSet(k, s); b.textContent = '✓ sent'; b.classList.remove('ok'); b.classList.add('ghost'); }, true);
 function toAuto() { lsSet(modeKey(), 'auto'); lsSet(dayKey(), null); orderedAt = me; update(); listSheet(true); toast(`📡 Auto order from ${me ? 'your location' : 'the first stop'}`); }
 document.addEventListener('keydown', (ev) => { if (ev.key === 'Escape' && document.getElementById('rsheet')) closeSheet(); });
 document.addEventListener('click', (ev) => {
   const f = ev.target.closest('[data-rfilter]'); if (f) { filter = f.dataset.rfilter; update(); return; }
-  const mv = ev.target.closest('[data-rmove]'); if (mv) { const [id, d] = mv.dataset.rmove.split('|'); moveStop(id, Number(d)); return; }
   const nx = ev.target.closest('[data-rnext]'); if (nx) { moveStop(nx.dataset.rnext, 'next'); return; }
   const a = ev.target.closest('[data-act]'); if (!a) return;
   const act = a.dataset.act;
   if (act === 'rClose') closeSheet();
-  else if (act === 'rAuto') toAuto();
+  else if (act === 'rTomorrow') tomorrowSheet();
+  else if (act === 'rAuto') { picking = false; picked = []; toAuto(); }
+  else if (act === 'rPick') { picking = !picking; picked = []; closeSheet(); if (picking && routeMode() === 'auto') setManual((S.routeSeq || []).map((s) => s.id)); /* v0.12.1 (#7) Jun: "직접 정한 순서" = tap the pins 1·2·3 — one button */ update(); toast(picking ? '👆 Tap the pins in the order you want to visit' : '✋ Order kept'); }
   else if (act === 'rOrder') {
     const run = () => { if (me) setHere(me); lsSet(modeKey(), 'auto'); lsSet(dayKey(), null); const seq = ordered(stopsFor(model()).withGps); lsSet(dayKey(), { ids: seq.map((s) => s.id), at: Date.now() }); draw(false); toast(`🔢 ${seq.length} stops ordered from ${me ? 'your location' : 'the first stop'} · ≈${routeKm(seq, me).toFixed(1)} km`); };
     if (navigator.geolocation) navigator.geolocation.getCurrentPosition((p) => { me = { lat: p.coords.latitude, lng: p.coords.longitude }; run(); }, run, { enableHighAccuracy: true, timeout: 8000, maximumAge: 60000 }); else run();

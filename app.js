@@ -7,15 +7,17 @@ import {
   initializeFirestore, persistentLocalCache, persistentMultipleTabManager, CACHE_SIZE_UNLIMITED,
   collection, doc, setDoc, getDoc, getDocs, getDocFromServer, getDocsFromCache, onSnapshot, query, where,
   serverTimestamp, Timestamp, waitForPendingWrites, terminate, clearIndexedDbPersistence,
-} from './vendor/firebase-firestore.js';
+  limit as qLimit } from './vendor/firebase-firestore.js';
 import * as R from './logic.js';
 import { initLang, setLang, getLang, locale, langSegHtml, fmtDate, fmtTime } from './i18n.js';
 import * as G from './geo.js';
 import * as CA from './capack.js';
 import * as B from './bs.js';
 import * as CAL from './cal.js';
+import * as RC from './receipt.js';
 
-export const APP_VERSION = 'kf-v0.10.2 (2026-09-29)';
+document.addEventListener('input', (ev) => { const ta = ev.target && ev.target.id === 'memoTa' ? ev.target : null; if (!ta) return; lsSet('kf_memo', ta.value.slice(0, 4000)); const h = $('#memoHint'); if (h) h.textContent = ta.value ? 'Saved on this phone' : 'Anything — it is saved as you type'; const b = document.querySelector('[data-act="memoToggle"]'); if (b) { b.classList.toggle('has', !!ta.value); b.textContent = '📝 Memo' + (ta.value ? ' ·' : ''); } }); /* v0.13.2 memo pad */
+export const APP_VERSION = 'kf-v0.17.1 (2026-10-04)';
 const ADMIN_EMAIL = 'koracarepokhara@gmail.com';
 // v0.9.3 (Jun 2026-09-29): a backup admin address — kept here only as a SHA-256 hash so the public app code does not show it. The rules hold the real list.
 const ADMIN_BACKUP_SHA256 = ['26d538c7399e96ff2b279a1ea2823fd31653cdc8290fd0e5f35ed492d1e13a17'];
@@ -55,14 +57,14 @@ export const OPT = {
   yesNo: ['Yes', 'No'],
   visitType: ['Routine check', 'Filter change', 'Repair', 'Sanitisation'],
   visitStatus: ['🔵 Scheduled', '🟡 In progress', '✅ Completed', '🚪 Nobody home', '🔴 Cancelled', '🟠 On hold'],
-  transport: ['Motorbike', 'Pickup · Taxi', 'Walk', 'Bicycle'],
   reqType: ['Breakdown', 'Water quality', 'Leak', 'Install request', 'Claim', 'Other'],
   priority: ['Urgent', 'Normal', 'Low'],
   reqStatus: ['Received', 'In progress', 'Done', 'On hold'],
   leadOutcome: ['New', 'Thinking', 'Demo booked', 'Signed', 'Rejected'],
   recOutcome: ['In progress', 'Recovered', 'Partial', 'Failed – no contact', 'Failed – refused', 'Failed – lost or damaged'],
   yesNoUnknown: ['Yes', 'No', 'Unknown'],
-  checkinKind: ['D7', 'D30', 'D60', 'D90', 'Quarterly call', 'Random happy call', 'Follow-up call', R.CHASE_KIND],
+  checkinKind: ['D7', 'Follow-up call', R.CHASE_KIND], /* v0.11: one call at day 7 · a follow-up when needed · payment chases (Jun 2026-09-30) */
+  checkinKindLabel: { D7: 'Day-7 call' },
   result: ['OK', 'Issue found'],
   stars: ['1', '2', '3', '4', '5'],
   topic: ['Install SOP (E-1)', 'A/S SOP (E-2)', 'Field rules (G-1)', 'Cash & payments', 'App use', 'Other'],
@@ -91,7 +93,7 @@ export const PERMS = [
   ['install', 'New installs'],
   ['visit', 'Visits · requests · calls · relocations'],
   ['pay', 'Record payments'],
-  ['cash', 'Take cash (G-1 §1-1: only Tara)'],
+  ['cash', 'Take cash (only Tara)'],
   ['editCust', 'Edit any customer'],
   ['money', 'See money & reports (VAT, deposits, CA pack, history)'],
   ['expense', 'Record & see expenses'],
@@ -115,8 +117,8 @@ export function can(p) {
 }
 const UV_FLOW_LIMIT = 1.2; // L/min — UV 6W verdict 2026-09-22: passes at or below 1.2
 const MAX_PHOTOS = 3, PHOTO_MAX_PX = 1024, PHOTO_Q = 0.6, PHOTO_MAX_CHARS = 950000;
-const COLS = ['customers', 'visits', 'payments', 'requests', 'leads', 'recoveries', 'trainings', 'checkins', 'stockMoves', 'expenses', 'deviceEvents', 'relocations', 'events', 'audit', 'contractEvents', 'screenings', 'claims', 'tools', 'payroll', 'waterTests'];
-const colsForMe = () => COLS.filter((c) => (c !== 'expenses' || can('expense') || can('money')) && (c !== 'audit' || isBoss()) && (c !== 'payroll' || isBoss())); // the change log and payroll: Jun and the deputy (rules too)
+const COLS = ['customers', 'visits', 'payments', 'requests', 'leads', 'recoveries', 'trainings', 'checkins', 'stockMoves', 'expenses', 'deviceEvents', 'relocations', 'events', 'audit', 'contractEvents', 'screenings', 'claims', 'tools', 'payroll', 'waterTests', 'milestones']; /* v0.15: milestone boards (Jun + deputy) */
+const colsForMe = () => COLS.filter((c) => (c !== 'expenses' || can('expense') || can('money')) && (c !== 'audit' || isBoss()) && (c !== 'payroll' || isBoss()) && (c !== 'milestones' || !!S.isAdmin)); // the change log and payroll: Jun + deputy · the boards: Jun only (10/3 "나만 봄") and the deputy (rules too)
 
 // ---------- Firebase ----------
 const app = initializeApp(firebaseConfig);
@@ -152,28 +154,43 @@ function newCode() {
   return 'KC-' + Date.now().toString(36).toUpperCase().slice(-5);
 }
 export function normPhone(raw) {
-  let d = String(raw || '').replace(/[^\d]/g, '');
+  const s0 = String(raw || '').trim(); let d = s0.replace(/[^\d]/g, '');
   if (d.length === 13 && d.startsWith('977')) d = d.slice(3);
-  return /^9\d{9}$/.test(d) ? '+977' + d : null;
+  if (/^9\d{9}$/.test(d)) return '+977' + d;
+  if (s0.startsWith('+') && /^\d{8,15}$/.test(d) && !d.startsWith('977')) return '+' + d; /* v0.16.0 (8) Jun 10/3 "내 번호로 해보게 풀어봐": a non-Nepal number written with + and its country code */
+  return null;
 }
 export const custLabel = (c) => c ? `${c.name || '(no name)'} (${c.code || '?'})` : '(unknown customer)';
 export const toleOf = (c) => (c && (c.tole === 'Other' ? c.toleOther : c.tole)) || '—';
-export const waLink = (phone, text) => `https://wa.me/${String(phone || '').replace(/\D/g, '')}${text ? '?text=' + encodeURIComponent(text) : ''}`;
+export const waLink = (phone, text, demo = DEMO) => `https://wa.me/${demo ? '' : String(phone || '').replace(/\D/g, '')}${text ? '?text=' + encodeURIComponent(text) : ''}`; /* v0.17.0 (9) E2: practice opens WhatsApp without a number — the demo numbers look like real people's */
 // ---- 🛵 "On my way" (v0.8 #7): a WhatsApp before leaving; stamped on the visit when it is saved (omwAt) so the desk can compare wasted trips with and without it
 const OMW = 'kf_omw';
 export const OMW_ETAS = [10, 20, 30, 45, 60];
 // English + Nepali in one message (no language field on customers). 🔴 Nepali lines need Tara's check — editable in Settings → WhatsApp messages.
+// v0.17.0 (8) visit-note buttons — "English | नेपाली", one per line (Settings → 📝 Visit note) · 🔴 the Nepali is a draft — Tara to check
+export const VISIT_LINES_DEFAULT = ['No leak — checked | चुहावट छैन — जाँच गरियो', 'Leak fixed (O-ring) | चुहावट मर्मत गरियो (ओ-रिङ)', 'PP filter colour checked — still fine | PP फिल्टरको रङ जाँचियो — अझै ठीक छ', 'UF backwashed | UF ब्याकवास गरियो', 'A part is needed — we will come back | पार्टपुर्जा चाहिन्छ — हामी फेरि आउँछौं', 'Weak flow — we check it at the next visit | पानी कम आउँछ — अर्को भ्रमणमा जाँच्छौं'];
+export function visitLines() { const raw = String(S.settings.visitLines || '').trim(); const ls = (raw ? raw.split('\n') : VISIT_LINES_DEFAULT).map((l) => { const [en, ...ne] = l.split('|'); return { en: String(en || '').trim().slice(0, 80), ne: ne.join('|').trim().slice(0, 90) }; }).filter((x) => x.en); return ls.slice(0, 12); }
 export const MSG_DEFAULTS = {
   omwEn: 'Namaste {name} ji 🙏 This is {tech} from KORA CARE. I am on my way for your water purifier visit — about {eta} minutes. If now is not a good time, reply here.',
   omwNe: 'नमस्ते {name} जी 🙏 म KORA CARE बाट {tech}। तपाईंको पानी प्युरिफायर भ्रमणका लागि आउँदैछु — करिब {eta} मिनेटमा। अहिले मिल्दैन भने यहीँ जवाफ दिनुहोस्।',
   missEn: 'Namaste {name} ji 🙏 KORA CARE came today at {time} for your water purifier visit, but nobody was home. We will come again on {retry}. If another day is better, reply here.',
   missNe: 'नमस्ते {name} जी 🙏 KORA CARE आज {time} मा तपाईंको पानी प्युरिफायर भ्रमणका लागि आएको थियो, तर घरमा कोही हुनुहुन्नथ्यो। हामी फेरि {retry} मा आउँछौं। अर्को दिन मिल्छ भने यहीँ जवाफ दिनुहोस्।',
+  nextEn: 'Namaste {name} ji 🙏 This is {tech} from KORA CARE. We plan to come tomorrow ({date}) for your water purifier visit. If tomorrow does not suit, reply here and we will pick another day.',
+  nextNe: 'नमस्ते {name} जी 🙏 म KORA CARE बाट {tech}। भोलि ({date}) तपाईंको पानी प्युरिफायर भ्रमणका लागि आउने योजना छ। भोलि मिल्दैन भने यहीँ जवाफ दिनुहोस्, अर्को दिन मिलाउँछौं।',
+  confEn: 'Namaste {name} ji 🙏 KORA CARE here. Your purifier installation is on {date} — is that still fine? Reply here if you need another day.',
+  confNe: 'नमस्ते {name} जी 🙏 KORA CARE। तपाईंको प्युरिफायर जडान {date} मा छ — ठीक छ? अर्को दिन चाहिए यहीँ जवाफ दिनुहोस्।',
 };
+export const nextText = (c, date) => { const o = { name: firstName(c), tech: myName() || 'KORA CARE', date }; return fillMsg(msgT('nextEn'), o) + '\n\n' + fillMsg(msgT('nextNe'), o); }; /* v0.14 (#4): the evening-before notice */
+export const confText = (c, date) => { const o = { name: firstName(c), date }; return fillMsg(msgT('confEn'), o) + '\n\n' + fillMsg(msgT('confNe'), o); }; /* v0.14 (#4): 3-day confirm for a booked install */
 const fillMsg = (tpl, o) => String(tpl).replace(/\{(\w+)\}/g, (_, k) => (o[k] ?? ''));
 const firstName = (c) => String((c && c.name) || '').trim().split(/\s+/)[0] || '';
 const msgT = (k) => (S.settings && String(S.settings[k] || '').trim()) || MSG_DEFAULTS[k];
 export const omwText = (c, eta) => { const o = { name: firstName(c), tech: myName() || 'KORA CARE', eta }; return fillMsg(msgT('omwEn'), o) + '\n\n' + fillMsg(msgT('omwNe'), o); };
 export const missText = (c, v) => { const ms = (v.savedAt && v.savedAt.t) || v.savedAtT || v._localT || Date.now(); const o = { name: firstName(c), time: new Date(ms).toTimeString().slice(0, 5), retry: v.retryDate || '' }; return fillMsg(msgT('missEn'), o) + '\n\n' + fillMsg(msgT('missNe'), o); };
+// v0.11.1 (#3) a payment reminder sent by WhatsApp is remembered on this phone (per home, per day) — the list shows "sent HH:MM" and drops that home to the bottom
+const REM = 'kf_rem';
+export function remMark(cid) { const m = lsGet(REM, {}); for (const k of Object.keys(m)) if (!m[k] || m[k].day !== today()) delete m[k]; m[cid] = { at: Date.now(), day: today() }; lsSet(REM, m); }
+export function remSent(cid) { const r = lsGet(REM, {})[cid]; return r && r.day === today() ? r : null; }
 export function omwMark(cid, eta) { const m = lsGet(OMW, {}); for (const k of Object.keys(m)) if (!m[k] || Date.now() - m[k].at > 2 * 864e5) delete m[k]; m[cid] = { at: Date.now(), day: today(), eta: Number(eta) || null, by: myName() }; lsSet(OMW, m); }
 export const omwFor = (cid, day) => { const e = lsGet(OMW, {})[cid]; return e && e.day === day ? e : null; };
 const omwClear = (cid) => { const m = lsGet(OMW, {}); if (m[cid]) { delete m[cid]; lsSet(OMW, m); } };
@@ -215,6 +232,33 @@ const photoPut = (id, v) => photoOp('readwrite', (st) => st.put(v, id));
 export const photoGet = (id) => photoOp('readonly', (st) => st.get(id));
 const photoDel = (id) => photoOp('readwrite', (st) => st.delete(id));
 
+// v0.16: the payment QR as a crisp 320px square PNG (contain on white) for settings/app.coQr
+function shrinkQr(file, px = 320) {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file); const img = new Image();
+    img.onload = () => {
+      const c = document.createElement('canvas'); c.width = px; c.height = px; const g = c.getContext('2d'); g.fillStyle = '#fff'; g.fillRect(0, 0, px, px);
+      const k = Math.min(px / img.naturalWidth, px / img.naturalHeight); const w = Math.round(img.naturalWidth * k), h = Math.round(img.naturalHeight * k); g.drawImage(img, (px - w) / 2, (px - h) / 2, w, h); URL.revokeObjectURL(url);
+      const d = c.toDataURL('image/png'); d.length > 120000 ? reject(new Error('QR picture too detailed — crop it to the QR')) : resolve(d);
+    };
+    img.onerror = () => { URL.revokeObjectURL(url); reject(new Error('cannot read this picture')); };
+    img.src = url;
+  });
+}
+// v0.15: a small square JPEG for the staff photo on the customer cards (≤ ~12 KB in the users doc)
+function shrinkAvatar(file, px = 160) {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file); const img = new Image();
+    img.onload = () => {
+      const s = Math.min(img.naturalWidth, img.naturalHeight); const sx = (img.naturalWidth - s) / 2, sy = (img.naturalHeight - s) / 2;
+      const c = document.createElement('canvas'); c.width = px; c.height = px; c.getContext('2d').drawImage(img, sx, sy, s, s, 0, 0, px, px); URL.revokeObjectURL(url);
+      let q = 0.82, d = c.toDataURL('image/jpeg', q); while (d.length > 24000 && q > 0.3) { q -= 0.1; d = c.toDataURL('image/jpeg', q); }
+      resolve(d);
+    };
+    img.onerror = () => { URL.revokeObjectURL(url); reject(new Error('cannot read this photo')); };
+    img.src = url;
+  });
+}
 function shrinkPhoto(file) {
   return new Promise((resolve, reject) => {
     const url = URL.createObjectURL(file); const img = new Image();
@@ -278,6 +322,12 @@ function stampPlace(col, data) {
   const h = G.hereNow(10 * 60e3);
   return h ? { ...data, savedAt: { lat: Number(h.lat.toFixed(5)), lng: Number(h.lng.toFixed(5)), acc: h.acc ? Math.round(h.acc) : null, t: Date.now() } } : { ...data, savedAtT: Date.now() };
 }
+let FIELD_L = null;
+export function fieldLabel(col, k) { /* v0.17.0 (1) A6 */
+  if (!FIELD_L) { FIELD_L = {}; for (const f of Object.values(FORMS)) { let sp = []; try { sp = (typeof f.spec === 'function' ? f.spec() : f.spec) || []; } catch (e) { sp = []; } for (const q of sp) if (q && q.k && q.l) { if (!FIELD_L[(f.col || '') + '|' + q.k]) FIELD_L[(f.col || '') + '|' + q.k] = q.l; if (!FIELD_L['|' + q.k]) FIELD_L['|' + q.k] = q.l; } } }
+  const own = { techNames: 'Technician names', perms: 'Rights', toles: 'Areas', role: 'Account status', fullName: 'Full name' };
+  return FIELD_L[(col || '') + '|' + k] || own[k] || FIELD_L['|' + k] || String(k).replace(/([a-z0-9])([A-Z])/g, '$1 $2').toLowerCase().replace(/\b(tds|gps|vat|pan|pp|uf|cto|uv|id|qr)\b/g, (x) => x.toUpperCase()).replace(/^./, (c) => c.toUpperCase());
+}
 // ---- change log (v0.8 security): every edit of a saved record leaves one append-only entry (who · when · field: before → after) — the admin reads it
 const AUDIT_SKIP = new Set(['updatedAt', 'updatedBy', 'createdAt', 'createdBy', '_pending', '_localT', 'savedAt', 'savedAtT', 'id']);
 const auditVal = (v) => { if (v === undefined || v === null || v === '') return ''; if (Array.isArray(v)) v = v.map((x) => (x && typeof x === 'object' ? JSON.stringify(x) : x)).join(', '); else if (typeof v === 'object') v = v.toMillis ? new Date(v.toMillis()).toISOString() : JSON.stringify(v); const t = String(v); return t.length > 120 ? t.slice(0, 117) + '…' : t; };
@@ -326,6 +376,7 @@ async function reconcile(manual) {
         try {
           const s = await getDocFromServer(doc(db, e.path));
           if (s.exists() && (e.isNew || !e.data || Object.keys(e.data).every((k) => JSON.stringify(s.get(k)) === JSON.stringify(e.data[k])))) { jMark(e.key, 'done'); if (e.photo) photoDel(e.id); }
+          else if (!e.isNew && s.exists() && s.get('updatedBy') && s.get('updatedBy') !== e.uid && s.get('updatedAt') && s.get('updatedAt').toMillis && s.get('updatedAt').toMillis() > e.t) { jMark(e.key, 'rejected', 'someone else saved this record after your edit — open it again and re-do your change'); } /* v0.11.1 (#14): no silent overwrite */
           else sendEntry(e);
         } catch (err) { if (err && err.code === 'permission-denied') jMark(e.key, 'rejected', err.code); }
       }
@@ -381,6 +432,7 @@ export function model() {
   const byCust = (list) => { const m = new Map(); for (const x of list) { if (!m.has(x.customerId)) m.set(x.customerId, []); m.get(x.customerId).push(x); } return m; };
   const payBy = byCust(D.payments), visBy = byCust(D.visits), chkBy = byCust(D.checkins);
   const ledgers = new Map(); const cust = new Map();
+  const FM = R.learnedMonths(D.customers, D.visits, S.settings.learnFilters !== 'No'); /* v0.14 (#3): observed intervals once 5+ changes */
   for (const c of D.customers) {
     const led = R.ledger(c, payBy.get(c.id) || [], t);
     ledgers.set(c.id, led);
@@ -388,18 +440,19 @@ export function model() {
     const status = c.status || 'Active';
     const dn = status === 'Active' ? R.dunning(led, t) : null;
     const nv = status === 'Active' ? R.nextVisit(c, vs) : null;
-    const fd = status === 'Active' ? R.filterDues(c, vs, t) : [];
+    const fd = status === 'Active' ? R.filterDues(c, vs, t, FM) : [];
+    const fb = status === 'Active' && S.settings.filterMode !== 'Separate' ? R.filterBatch(fd, FM) : null; /* v0.15: filters go together */
     const ob = status === 'Active' ? R.onboarding(c, chkBy.get(c.id) || [], t) : [];
     const chases = R.chaseLog(chkBy.get(c.id)); const pr = status === 'Active' && led.overdue > 0 ? R.promiseOf(chases, payBy.get(c.id), t) : null; /* v0.9 #1 */
     const dot = status === 'Churned' ? 'k' : status === 'Paused' ? 'b' : led.daysOverdue >= 7 ? 'r' : led.overdue > 0 ? 'y' : 'g';
-    cust.set(c.id, { c, led, dn, nv, fd, ob, vs, dot, status, chases, pr });
+    cust.set(c.id, { c, led, dn, nv, fd, fb, ob, vs, dot, status, chases, pr });
   }
   const act = [...cust.values()].filter((x) => x.status === 'Active');
-  const collections = act.filter((x) => x.dn).sort((a, b) => b.dn.days - a.dn.days);
   // Dispatch: once Jun gives a staff member their own homes, their field lists show those + the unassigned ones.
   const me = isBoss() ? '' : myName();
   const mineOnly = !!me && act.some((x) => R.assigneeOf(x.c, t) === me);
-  const forMe = (x) => !mineOnly || !R.assigneeOf(x.c, t) || R.assigneeOf(x.c, t) === me;
+  const forMe = (x) => !mineOnly || !x.c || !R.assigneeOf(x.c, t) || R.assigneeOf(x.c, t) === me;
+  const collections = act.filter((x) => x.dn).filter(forMe).sort((a, b) => b.dn.days - a.dn.days); /* v0.11.1 (#10): collections + requests follow the same assignment as visits */
   const visitsDue = act.filter((x) => x.nv && x.nv.date <= R.addDays(t, 0)).map((x) => ({ ...x, due: x.nv.date })).concat(
     act.filter((x) => !(x.nv && x.nv.date <= t) && x.fd.some((f) => f.status === 'overdue')).map((x) => ({ ...x, due: x.fd.filter((f) => f.status === 'overdue').map((f) => f.due).sort()[0], filterOnly: true })),
   ).filter(forMe).sort((a, b) => String(a.due).localeCompare(String(b.due)));
@@ -412,21 +465,21 @@ export function model() {
   const hm = CAL.holidayMap(S.settings.holidays);
   const isHol = (d) => CAL.isOff(hm, R.fmtD(d));
   const openReq = D.requests.filter((r) => r.status !== 'Done').map((r) => ({ r, sla: R.requestSla(r.receivedAtMs || Date.parse(r.receivedAt || '') || Date.now(), isHol), c: cust.get(r.customerId) }))
-    .sort((a, b) => a.sla.replyBy - b.sla.replyBy);
+    .filter((o) => !o.c || forMe({ c: o.c.c })).sort((a, b) => a.sla.replyBy - b.sla.replyBy);
   const leadsDue = D.leads.filter((l) => !['Signed', 'Rejected'].includes(l.outcome) && R.isDate(l.followUpDate) && l.followUpDate <= t);
   const metrics = R.metrics(D, ledgers, t, S.settings);
   const deposits = R.depositBook(D.customers, ledgers, D.recoveries);
   const vat = R.vatByMonth(D.payments, ledgers, D.recoveries);
-  const referrals = R.referralRewards(D.customers, D.payments, ledgers, t);
+  const referrals = R.referralRewards(D.customers, D.payments, ledgers, t, referralOn()); /* v0.15: off unless the campaign is switched on */
   const learning = R.filterLearning(D.customers.filter((c) => c.status !== 'Churned'), D.visits);
   const filtersAll = act.flatMap((x) => x.fd.filter((f) => f.status !== 'none').map((f) => ({ ...f, x })));
   // Alerts: things that need a person today (each links to its list)
   const alerts = [];
-  const pastReply = openReq.filter((o) => Date.now() > o.sla.replyBy).length; if (pastReply) alerts.push({ lvl: 'bad', ic: '📋', t: `${pastReply} request(s) past the reply time (G-1 §2-4)`, list: 'requests' });
+  const pastReply = openReq.filter((o) => Date.now() > o.sla.replyBy).length; if (pastReply) alerts.push({ lvl: 'bad', ic: '📋', t: `${pastReply} request(s) past the reply time`, list: 'requests' });
   const late7 = collections.filter((x) => x.dn.stage === 'visit' && !(x.pr && x.pr.status === 'waiting')).length; if (late7) alerts.push({ lvl: 'bad', ic: '💰', t: `${late7} home(s) 7+ days late — home visit`, list: 'collections' });
   const broken = collections.filter((x) => x.pr && x.pr.status === 'broken').length; if (broken) alerts.push({ lvl: 'bad', ic: '🤝', key: 'promise:broken', t: `${broken} payment promise(s) broken`, list: 'collections' });
   const fOver = filtersAll.filter((f) => f.status === 'overdue').length; if (fOver) alerts.push({ lvl: 'warn', ic: '🧪', t: `${fOver} filter(s) past the booking date`, list: 'filters' });
-  const callsOver = calls.filter((x) => x.o.status === 'overdue').length; if (callsOver) alerts.push({ lvl: 'warn', ic: '📞', t: `${callsOver} onboarding call(s) overdue`, list: 'calls' });
+  const callsOver = calls.filter((x) => x.o.status === 'overdue').length; if (callsOver) alerts.push({ lvl: 'warn', ic: '📞', t: `${callsOver} day-7 call(s) overdue`, list: 'calls' });
   if (metrics.fcl.ready) alerts.push({ lvl: 'ok', ic: '📦', t: 'FCL#1: all order conditions met — order now', report: 'stock' });
   else if (metrics.fcl.stockSignal) alerts.push({ lvl: 'warn', ic: '📦', t: 'Stock is at the FCL#1 order point', report: 'stock' });
   for (const [k, g] of Object.entries(metrics.gate)) if (g.judgeable && g.bad) alerts.push({ lvl: 'bad', ic: '🧭', t: `Direction gate: ${k} crossed its trigger`, report: 'gate' });
@@ -462,15 +515,16 @@ export function model() {
   if (rcSlow.length) alerts.push({ lvl: 'warn', ic: '🛠️', key: 'repair:slow', t: `${rcSlow.length} repair(s) open over 7 days — the credit grows each day`, list: 'repairs' });
   if (rcDue.length && isBoss()) alerts.push({ lvl: 'warn', ic: '🛠️', key: 'repair:credit', t: `${rcDue.length} late repair(s) — give the credit`, list: 'repairs' });
   const pLate = [...cust.values()].filter((x) => x.status === 'Paused' && R.isDate(x.c.pausedUntil) && x.c.pausedUntil < t).length; if (pLate) alerts.push({ lvl: 'warn', ic: '⏸️', key: 'pause:late', t: `${pLate} paused home(s) past their restart day`, list: 'paused' });
-  const offTomorrow = (hm[tomorrow] || []).find((h) => h.kind === 'all'); if (offTomorrow) alerts.push({ lvl: 'info', ic: '🎉', t: `Office closed tomorrow — ${offTomorrow.n}`, cal: tomorrow });
+  const offTomorrow = (hm[tomorrow] || []).find((h) => h.kind === 'all'); if (offTomorrow) alerts.push({ lvl: 'info', ic: '🏖️', t: `Office closed tomorrow — ${offTomorrow.n}`, cal: tomorrow });
   if (can('money')) for (const dl of CAL.deadlines(t, R.addDays(t, 5), S.settings)) alerts.push({ lvl: dl.d <= R.addDays(t, 2) ? 'bad' : 'warn', ic: dl.ic, t: `${dl.t} — ${dl.d === t ? 'today' : 'by ' + dl.d}${CAL.isOff(hm, dl.d) ? ' (a holiday — do it the day before)' : ''}`, cal: dl.d });
   // watch list (homes to look after this week) — "✓ checked" hides a home for 7 days on this device unless its points go up
   const wOk = lsGet(WATCH_OK, {});
   const watchAll = R.watchList(cust, D, t).filter((w) => forMe(w.x));
-  const watch = watchAll.filter((w) => { const k = wOk[w.x.c.id]; return !(k && k.until >= t && w.score <= k.score); });
+  const watchVis = watchAll.filter((w) => { const k = wOk[w.x.c.id]; return !(k && k.until >= t && w.score <= k.score); });
+  const watch = watchVis.slice(0, 10); /* v0.11.2 (#13) Jun: "최대 10까지만" — the ten highest scores, the rest wait their turn */
   const wHigh = watch.filter((w) => w.lvl === 'high').length; if (wHigh) alerts.push({ lvl: 'warn', ic: '⚠️', key: 'watch:high', t: `${wHigh} home(s) to look after this week`, list: 'watch' });
   if (isBoss() && S.fleetCache) for (const d of S.fleetCache) { const q = deviceIssues(d); if (q.lvl === 'bad') { alerts.push({ lvl: 'bad', ic: '📱', key: 'phone:' + d.id, t: `${userName(d.uid, d.name || d.email || 'A phone')}: ${q.out.filter((x) => x[0] === 'bad').map((x) => x[1]).join(' · ')}`, side: 'phones' }); } }
-  const m = { t, D, cust, ledgers, approvals, repairCr, contractOpen, claimsSt, vials, collections, visitsDue, calls, tomorrowBills, openReq, leadsDue, metrics, deposits, vat, referrals, learning, filtersAll, alerts, devices, expMonths, relOpen, hm, mineOnly, watch, watchChecked: watchAll.length - watch.length, filterPlan, capacity };
+  const m = { t, D, cust, ledgers, approvals, repairCr, contractOpen, claimsSt, vials, collections, visitsDue, calls, tomorrowBills, openReq, leadsDue, metrics, deposits, vat, referrals, learning, filtersAll, alerts, devices, expMonths, relOpen, hm, mineOnly, watch, watchChecked: watchAll.length - watchVis.length, watchMore: watchVis.length - watch.length, filterPlan, capacity };
   modelCache = { ver: S.ver, day: t, m };
   return m;
 }
@@ -512,6 +566,7 @@ async function wipePhone() {
   S.wiped = true; S.profile = {};
 }
 export const myName = () => (S.isAdmin ? 'Jun' : (S.profile && S.profile.name) || (S.user && S.user.email ? S.user.email.split('@')[0] : ''));
+export const referralOn = () => S.settings.referralCampaign === 'Yes'; /* v0.15: the referral campaign (card · rewards · tree) is off until Settings says Yes */
 export const techNames = () => { const base = ['Tara', 'Jun']; const extra = String(S.settings.techNames || '').split(',').map((s) => s.trim()).filter(Boolean); return [...new Set([...base, ...extra])]; };
 
 // ================= forms =================
@@ -528,7 +583,7 @@ function field(f, v) {
   switch (f.t) {
     case 'chips': {
       const sel = f.multi ? (Array.isArray(val) ? val : []) : [val];
-      input = `<div class="chips" data-group="${f.k}" data-multi="${f.multi ? 1 : 0}">` + opts.map((o) => `<button type="button" class="chip${sel.includes(o) ? ' on' : ''}" data-v="${esc(o)}">${esc(o)}</button>`).join('') + '</div>'; break;
+      input = `<div class="chips" data-group="${f.k}" data-multi="${f.multi ? 1 : 0}"${f.noi18n ? ' data-noi18n' : ''}>` + opts.map((o) => `<button type="button" class="chip${sel.includes(o) ? ' on' : ''}" data-v="${esc(o)}">${esc((f.lbl && f.lbl[o]) || o)}</button>`).join('') + '</div>'; break; /* lbl = what is shown; the saved value stays o */
     }
     case 'checks': {
       const sel = Array.isArray(val) ? val : [];
@@ -538,7 +593,7 @@ function field(f, v) {
       input = `<select id="f_${f.k}" name="${f.k}"><option value="">— choose —</option>` + opts.map((o) => { const [ov, ol] = Array.isArray(o) ? o : [o, o]; return `<option value="${esc(ov)}"${String(ov) === String(val) ? ' selected' : ''}>${esc(ol)}</option>`; }).join('') + '</select>'; break;
     case 'customer': {
       const list = arr('customers').filter((c) => c.status !== 'Churned' || c.id === val).sort((a, b) => String(a.name).localeCompare(String(b.name)));
-      input = `<select id="f_${f.k}" name="${f.k}"><option value="">— choose customer —</option>${list.map((c) => `<option value="${esc(c.id)}"${c.id === val ? ' selected' : ''}>${esc(custLabel(c))} · ${esc(toleOf(c))}</option>`).join('')}</select>`; break;
+      input = `${list.length > 12 ? `<input type="search" class="custpick" data-for="f_${f.k}" placeholder="Search name · KC code · phone" autocomplete="off">` : ''}<select id="f_${f.k}" name="${f.k}"><option value="">— choose customer —</option>${list.map((c) => `<option value="${esc(c.id)}"${c.id === val ? ' selected' : ''}>${esc(custLabel(c))} · ${esc(toleOf(c))}</option>`).join('')}</select>`; break; /* v0.11.1 (#8): 750 homes are not a wheel */
     }
     case 'textarea': input = `<textarea id="f_${f.k}" name="${f.k}" placeholder="${esc(f.ph || '')}">${esc(val)}</textarea>`; break;
     case 'gps': {
@@ -561,7 +616,8 @@ function field(f, v) {
     default:
       input = `<input id="f_${f.k}" name="${f.k}" type="${f.t}" value="${esc(val)}" placeholder="${esc(f.ph || '')}" ${f.t === 'tel' ? 'inputmode="tel"' : ''} autocomplete="off">`;
   }
-  return `<div class="fld" data-k="${f.k}">${lab}${input}${f.hint ? `<div class="hint">${esc(f.hint)}</div>` : ''}<div class="err hidden"></div><div class="warn hidden"></div></div>`;
+  const w1 = ['text', 'tel', 'number', 'date', 'time', 'email', 'select', 'month', 'url'].includes(f.t) || (f.t === 'chips' && !f.multi && (opts || []).length <= 3 && (opts || []).every((o) => String((f.lbl && f.lbl[o]) || o).length <= 16)); /* v0.17.0 (4) B3 */
+  return `<div class="fld${w1 ? ' w1' : ''}" data-k="${f.k}">${lab}${input}${f.hint ? `<div class="hint">${esc(f.hint)}</div>` : ''}<div class="err hidden"></div><div class="warn hidden"></div></div>`;
 }
 function readForm(form, spec) {
   const v = {};
@@ -638,25 +694,22 @@ FORMS.install = {
     { k: 'tole', l: 'Tole', t: 'select', o: OPT.tole, req: 1 },
     { k: 'toleOther', l: 'Tole name', t: 'text', show: (v) => v.tole === 'Other' },
     { k: 'houseDetail', l: 'How to find the house', t: 'textarea', ph: 'e.g. next to the blue-gate shop, 2nd floor' },
-    { k: 'householdSize', l: 'People in the household', t: 'number' },
-    { k: 'prevWater', l: 'Drinking water before KORA', t: 'chips', o: OPT.prevWater },
     { k: 'referral', l: 'How they heard about KORA', t: 'select', o: OPT.referral, req: 1 },
-    { k: 'referrerId', l: 'Referred by (existing customer)', t: 'customer', show: (v) => v.referral === 'Word of mouth', hint: 'Referral rewards follow G-1 §4: 1 month free for both (referrer after 3 months).' },
+    { k: 'referrerId', l: 'Referred by (existing customer)', t: 'customer', show: (v) => v.referral === 'Word of mouth', hint: 'During a referral campaign the referrer gets 50% off a bill, 3 months after this home joins.' },
     { k: 'referrerName', l: 'Referred by (name, if not a customer)', t: 'text', show: (v) => v.referral === 'Word of mouth' },
-    { t: 'section', l: 'Water & site', hint: 'E-1 step 1 — measure before installing.' },
+    { t: 'section', l: 'Water & site', hint: 'Measure before installing.' },
     { k: 'waterSource', l: 'Water source', t: 'chips', o: OPT.waterSource, req: 1 },
-    { k: 'pressurePsi', l: 'Water pressure (PSI)', t: 'number', hint: '30–80 normal · 20–30 low (pump needed) · <20 very low · >80 needs a reducer (E-1)' },
+    { k: 'pressurePsi', l: 'Water pressure (PSI)', t: 'number', hint: '30–80 normal · 20–30 low (pump needed) · <20 very low · >80 needs a reducer' },
     { k: 'rawTds', l: 'Raw water TDS', t: 'number', req: 1 },
     { t: 'section', l: 'Device' },
     { k: 'deviceSerial', l: 'Device serial number', t: 'text', req: 1 },
-    { k: 'installDate', l: 'Install date', t: 'date', req: 1, def: today, hint: 'Monthly bill is on this same day every month (G-1 §1-3).' },
+    { k: 'installDate', l: 'Install date', t: 'date', req: 1, def: today, hint: 'The monthly bill falls on this same day every month.' },
     { k: 'signUpDate', l: 'Sign-up date', t: 'date', req: 1, def: today },
-    { k: 'plan', l: 'Plan', t: 'chips', o: OPT.plan, req: 1, def: 'Standard' },
-    { t: 'section', l: 'Final checks', hint: 'E-1 final checklist — all must be ticked. Plan #8: flow and water source are required.' },
+    { t: 'section', l: 'Final checks', hint: 'All must be ticked. Flow and water source are required.' },
     { k: 'checks', l: 'Checklist', t: 'checks', o: OPT.installChecks, req: 1 },
     { k: 'purifiedTds', l: 'Purified water TDS', t: 'number', req: 1 },
-    { k: 'flow', l: 'Flow at the tap (L/min)', t: 'number', step: 0.1, req: 1, ph: 'e.g. 1.1', hint: 'UV 6W passes at 1.2 L/min or less (verdict 2026-09-22).' },
-    { t: 'section', l: 'First-day payment', hint: 'Day 1 = NPR 4,900 (install fee incl. first month). G-1 §1-1: do not finish the install before the payment is confirmed.' },
+    { k: 'flow', l: 'Flow at the tap (L/min)', t: 'number', step: 0.1, req: 1, ph: 'e.g. 1.1', hint: 'The UV lamp is safe at 1.2 L/min or less.' },
+    { t: 'section', l: 'First-day payment', hint: 'Day 1 = NPR 4,900 (install fee incl. first month). Do not finish the install before the payment is confirmed.' },
     { k: 'firstPay', l: 'First-day payment', t: 'chips', o: OPT.firstPay, req: 1 },
     { k: 'payMethod', l: 'Paid by', t: 'chips', o: OPT.method, show: (v) => String(v.firstPay).startsWith('Received') },
     { k: 'payRef', l: 'Transaction ID', t: 'text', show: (v) => String(v.firstPay).startsWith('Received') },
@@ -667,45 +720,51 @@ FORMS.install = {
     { k: 'signName', l: 'Signed by (name)', t: 'text' },
     { k: 'sign', l: '', t: 'sign' },
     { k: 'noSign', l: 'No signature — why?', t: 'chips', o: OPT.noSign, show: (v) => !v.sign },
-    { t: 'section', l: 'Photos', hint: 'G-1 §2-1: device as installed · TDS meter (raw vs purified) · signed contract.' },
+    { t: 'section', l: 'Photos', hint: 'Device as installed · TDS meter (raw vs purified) · signed contract.' },
     { k: 'photos', l: 'Photos (3 required)', t: 'photos' },
     { t: 'section', l: 'Other' },
     { k: 'gps', l: 'House location', t: 'gps' },
     { k: 'agent', l: 'Installed by', t: 'chips', o: techNames, req: 1, def: myName },
-    { k: 'tags', l: 'Tags (comma separated)', t: 'text', ph: 'e.g. dog, landlord, hard water' },
-    { k: 'buyerPan', l: 'Buyer PAN (business customers only)', t: 'text', ph: '9 digits — leave empty for homes', hint: 'Printed in the IRD sales book. Hotels, shops, offices usually have one.' },
-    { k: 'notes', l: 'Notes', t: 'textarea', ph: 'hard water, options added, …' },
+    ...(editingForm() ? [{ k: 'buyerPan', l: 'Buyer PAN (business customers only)', t: 'text', ph: '9 digits — leave empty for homes', hint: 'Printed in the IRD sales book. Hotels, shops, offices usually have one.' }] : []), /* v0.11 (Tara 2026-09-30): not on a new install — the office adds it when a business asks for it */
+    { k: 'notes', l: 'Special comment', t: 'textarea', ph: 'e.g. dog in the yard · call before coming · landlord must be present' },
     { k: 'privateNotes', l: '🔒 Private notes (only admin sees)', t: 'textarea', admin: 1 },
   ],
+  // v0.11: from a lead (the id travels with the screen, never a global — a cancelled convert must not fill a later install) and its sign-up screening
+  prefill(p) {
+    const l = p.lead ? S.D.leads.get(p.lead) : null; S.convertLead = l ? l.id : '';
+    const sc = l ? R.findScreening(arr('screenings'), l.id, normPhone(l.phone)) : null;
+    return { ...(l ? { name: l.name || '', phone: String(l.phone || '').replace('+977', ''), tole: l.tole || '', ward: l.ward || '', referral: l.channel || '', referrerId: l.referrerId || '' } : {}), ...(sc && sc.waterSource ? { waterSource: sc.waterSource } : {}) };
+  },
   check(v, confirmed) {
     const errs = {}, warns = {};
     if (!v.name || v.name.length < 2) errs.name = 'Enter the customer name.';
     const phone = normPhone(v.phone);
     if (!phone) errs.phone = 'Enter a 10-digit mobile number starting with 9 (e.g. 98XXXXXXXX).';
-    else { const dup = arr('customers').find((c) => c.phone === phone && c.id !== v._id); if (dup && !confirmed) warns.phone = `Same number as ${custLabel(dup)}. Save anyway only if this is really a different household.`; }
+    else { const dup = arr('customers').find((c) => c.phone === phone && c.id !== v._id); if (dup && !confirmed) warns.phone = `Same number as ${custLabel(dup)}. Save anyway only if this is really a different household.`; else if (!phone.startsWith('+977') && !confirmed) warns.phone = 'Not a Nepal number — fine for a test or a foreign phone (WhatsApp still works).'; }
     need(errs, v, 'zone', 'Choose a zone.'); need(errs, v, 'ward', 'Choose a ward.'); need(errs, v, 'tole', 'Choose a tole.');
     if (v.tole === 'Other' && !v.toleOther) errs.toleOther = 'Write the tole name.';
     if (!inRange(v.householdSize, 1, 40)) errs.householdSize = 'Check this number (1–40).';
     need(errs, v, 'referral', 'Choose one.'); need(errs, v, 'waterSource', 'Choose the water source.');
     if (!inRange(v.pressurePsi, 0, 200)) errs.pressurePsi = 'Check the pressure (0–200 PSI).';
-    else if (v.pressurePsi !== null && !confirmed && (v.pressurePsi < 20 || v.pressurePsi > 80)) warns.pressurePsi = v.pressurePsi < 20 ? 'Very low pressure — tell the customer flow may be slow (E-1).' : 'High pressure — a reducing valve is needed (E-1).';
+    else if (v.pressurePsi !== null && !confirmed && (v.pressurePsi < 20 || v.pressurePsi > 80)) warns.pressurePsi = v.pressurePsi < 20 ? 'Very low pressure — tell the customer flow may be slow.' : 'High pressure — a reducing valve is needed.';
     if (v.rawTds === null) errs.rawTds = 'Measure the raw water TDS.'; else if (!inRange(v.rawTds, 0, 5000)) errs.rawTds = 'Check the TDS number (0–5000).';
-    else if (v.rawTds >= 250 && !confirmed) warns.rawTds = 'TDS 250+ → offer the Siliphos option (E-1).';
-    need(errs, v, 'deviceSerial', 'Enter the device serial.'); need(errs, v, 'installDate', 'Enter the date.'); need(errs, v, 'signUpDate', 'Enter the date.'); need(errs, v, 'plan', 'Choose a plan.');
-    if ((v.checks || []).length < OPT.installChecks.length && !v._edit) errs.checks = `Tick all ${OPT.installChecks.length} checks before finishing (E-1).`;
+    else if (v.rawTds >= 250 && !confirmed) warns.rawTds = 'TDS 250+ → offer the Siliphos option.';
+    need(errs, v, 'deviceSerial', 'Enter the device serial.'); need(errs, v, 'installDate', 'Enter the date.'); need(errs, v, 'signUpDate', 'Enter the date.');
+    if ((v.checks || []).length < OPT.installChecks.length && !v._edit) errs.checks = `Tick all ${OPT.installChecks.length} checks before finishing.`;
     if (v.purifiedTds === null && !v._edit) errs.purifiedTds = 'Measure the purified water TDS.'; else if (!inRange(v.purifiedTds, 0, 5000)) errs.purifiedTds = 'Check the TDS number.';
-    if (v.flow === null && !v._edit) errs.flow = 'Measure the flow (plan #8).'; else if (!inRange(v.flow, 0, 10)) errs.flow = 'Check the flow (0–10 L/min).';
+    if (v.flow === null && !v._edit) errs.flow = 'Measure the flow.'; else if (!inRange(v.flow, 0, 10)) errs.flow = 'Check the flow (0–10 L/min).';
     else if (v.flow > UV_FLOW_LIMIT && !confirmed) warns.flow = `Above ${UV_FLOW_LIMIT} L/min the UV margin is thin — tighten the flow restrictor.`;
     if (!v._edit) {
       need(errs, v, 'firstPay', 'Choose one.');
       if (String(v.firstPay).startsWith('Received') && !v.payMethod) errs.payMethod = 'How was it paid?';
-      if (v.firstPay === 'Not yet' && !confirmed) warns.firstPay = 'G-1 §1-1: the install is not finished until the payment is confirmed. It will show as due today.';
-      if (v.payMethod === 'Cash' && !mayTakeCash() && !confirmed) warns.payMethod = 'G-1 §1-1: only Tara may take cash.';
+      if (v.firstPay === 'Not yet' && !confirmed) warns.firstPay = 'The install is not finished until the payment is confirmed. It will show as due today.';
+      if (v.payMethod === 'Cash' && !mayTakeCash() && !confirmed) warns.payMethod = 'Only Tara may take cash.';
       const np = S.formPhotos.length;
-      if (!np) errs.photos = 'Add the photos (G-1 §2-1: a visit without photos does not count).';
-      else if (np < 3 && !confirmed) warns.photos = `G-1 §2-1 asks for 3 photos — you have ${np}.`;
+      if (!np) errs.photos = 'Add the photos — a visit without photos does not count.';
+      else if (np < 3 && !confirmed) warns.photos = `3 photos are needed — you have ${np}.`;
     }
     need(errs, v, 'agent', 'Who installed?');
+    if (!v._edit && !confirmed && !(v.gps && Number.isFinite(Number(v.gps.lat)))) warns.gps = 'No location saved — tap “Get location now” at the door. Without it the house is missing from the map and the route.'; /* v0.11.1 (#4) */
     if (!v._edit && !confirmed && S.settings.screenWarn === 'Yes' && phone && !R.findScreening(arr('screenings'), S.convertLead, phone)) warns.name = 'No sign-up screening for this phone yet — do one first (🔎 New → Sign-up screening), or save anyway.';
     const scr = !v._edit && phone ? R.findScreening(arr('screenings'), S.convertLead, phone) : null; /* v0.10 H5: the ID must be seen by the install day */
     if (scr && !confirmed && scr.idSeen !== 'Yes') warns.name = (warns.name ? warns.name + ' ' : '') + 'ID not seen at the screening — see the ID before installing (hold).';
@@ -719,6 +778,10 @@ FORMS.install = {
     delete data.firstPay; delete data.payMethod; delete data.payRef; delete data.payBillNo; delete data.sign; const vial = data.vialStarted === 'Yes'; delete data.vialStarted;
     if (isNew) { data.signed = !!sig; if (sig) data.noSign = ''; } else { delete data.signName; delete data.noSign; } /* the edit form has no signature box */
     if (isNew) { data.code = newCode(); data.status = 'Active'; }
+    if (!data.plan) data.plan = 'Standard'; /* v0.11.2 (#19) Jun: one plan — "기본+전원옵션 빼라" */
+    // v0.11: household size and the water they drank before come from the sign-up screening (asked once, there) — sales statistics, blank when there was no screening
+    const scr0 = isNew ? R.findScreening(arr('screenings'), S.convertLead, phone) : null;
+    if (scr0) { if (data.householdSize === undefined || data.householdSize === null) data.householdSize = scr0.householdSize ?? null; if (!data.prevWater) data.prevWater = scr0.prevWater || ''; }
     // converted from a lead → link both ways and mark the lead signed (sales stage days)
     const lead0 = isNew && S.convertLead ? S.D.leads.get(S.convertLead) : null; // the same person only (a cancelled convert must not link a later install)
     const lead = lead0 && (lead0.phone ? normPhone(lead0.phone) === phone : String(lead0.name || '').trim() === String(v.name || '').trim()) ? lead0 : null;
@@ -732,7 +795,7 @@ FORMS.install = {
     }
     if (isNew && ok && vial) save(`waterTests/${newId('waterTests')}`, { customerId: id, sampledDate: v.installDate, result: '', by: myName() }, true); /* v0.9 #10 */
     const np = (isNew ? savePhotos(id, `customers/${id}`, 'install') : savePhotos(id, `customers/${id}`, 'customer')) + (isNew && ok ? saveSign(id, `customers/${id}`, sig, v.signName) : 0);
-    return { ok, np, go: ['customers', 'detail', { id }] };
+    return { ok, np, go: ['customers', 'detail', { id, inst: id }] }; /* v0.14: installed card button on the page */
   },
 };
 FORMS.customerEdit = {
@@ -743,17 +806,20 @@ FORMS.customerEdit = {
     // v0.9 #2: each pause is one line in the home's pause history (start · why · planned restart · restarted)
     { k: 'pausedFrom', l: 'Paused from', t: 'date', def: () => ((editedCust() || {}).status === 'Paused' ? '' : today()), show: (v) => v.status === 'Paused', hint: 'Empty is fine for a home that was paused before this box existed.' },
     { k: 'pauseReason', l: 'Why paused', t: 'chips', o: OPT.pauseReason, show: (v) => v.status === 'Paused' },
-    { k: 'pausedUntil', l: 'Paused until', t: 'date', show: (v) => v.status === 'Paused', hint: 'Empty = the skipped bill day + 1 month − 1 day. At most 1 month (Jun 2026-09-29).' },
+    { k: 'pausedUntil', l: 'Paused until', t: 'date', show: (v) => v.status === 'Paused', hint: 'Empty = the skipped bill day + 1 month − 1 day. At most 1 month.' },
     { k: 'pauseInfo', t: 'info', show: (v) => v.status === 'Paused' },
     { k: 'resumedOn', l: 'Restarted on', t: 'date', def: today, show: (v) => v.status === 'Active' && (editedCust() || {}).status === 'Paused' },
     ...FORMS.install.spec().filter((f) => !['checks', 'purifiedTds', 'flow', 'firstPay', 'payMethod', 'payRef', 'payBillNo', 'photos', 'signName', 'sign', 'noSign', 'vialStarted'].includes(f.k) && !(f.t === 'section' && ['Final checks', 'First-day payment', 'Photos', 'Customer signature', 'Raw-water vial (PoC)'].includes(f.l))),
+    { t: 'section', l: 'Household', hint: 'Usually filled from the sign-up screening.' },
+    { k: 'householdSize', l: 'People in the household', t: 'number' },
+    { k: 'prevWater', l: 'Drinking water before KORA', t: 'chips', o: OPT.prevWater },
     { k: 'photos', l: 'Add photos', t: 'photos' },
   ],
   info(v) {
     const c = (v._id && S.D.customers.get(v._id)) || editedCust(); if (!c || v.status !== 'Paused') return '';
     const line = (x) => `<div>${esc(x)}</div>`; const E = R.pauseEligibility(c, model().ledgers.get(c.id), today(), { from: v.pausedFrom, reason: v.pauseReason, until: v.pausedUntil });
     return (E.skipDue ? line(`Skipped bill: ${E.skipDue} · paused until ${v.pausedUntil || E.until}`) : '') + line('Back within 15 days of that bill day → that bill is charged. Either way it is the one pause for 12 months.') + line('Collect the cartridges at the start · fit new ones at the restart visit.')
-      + (E.why.length ? `<div class="warn" style="margin-top:6px">⚠️ ${E.why.map(esc).join('<br>')}</div>` : line('✅ All pause rules met (Jun 2026-09-29).'));
+      + (E.why.length ? `<div class="warn" style="margin-top:6px">⚠️ ${E.why.map(esc).join('<br>')}</div>` : line('✅ All pause rules met.'));
   },
   check(v, confirmed) {
     const r = FORMS.install.check({ ...v, _edit: true }, confirmed); if (v.status === 'Churned' && !v.churnDate) r.errs.churnDate = 'When did they leave?';
@@ -785,6 +851,7 @@ FORMS.visit = {
   col: 'visits', title: 'Visit', icon: '🔧',
   spec: () => [
     custPicker,
+    { k: 'dueBox', t: 'info' }, /* v0.11.1 (#7): what is due at this house */
     { k: 'date', l: 'Visit date', t: 'date', req: 1, def: today },
     { k: 'visitType', l: 'Visit type', t: 'chips', o: OPT.visitType, req: 1, def: 'Routine check' },
     { k: 'status', l: 'Status', t: 'chips', o: OPT.visitStatus, req: 1, def: '✅ Completed' },
@@ -792,50 +859,58 @@ FORMS.visit = {
     { k: 'noShowReason', l: 'What happened?', t: 'chips', o: OPT.noShowReason, show: (v) => R.isNoShow(v) },
     { k: 'waitedMin', l: 'Minutes you waited or called', t: 'number', show: (v) => R.isNoShow(v) },
     { k: 'retryDate', l: 'Try again on', t: 'date', show: (v) => R.isNoShow(v), hint: 'The visit stays owed — this date becomes the next visit. After saving, send the "sorry we missed you" message from the customer page.' },
-    { t: 'section', k: 'secFilters', l: 'Filters', hint: 'E-2: booking intervals only — decide by what you see. PP brown/black → replace now.', show: (v) => !R.isNoShow(v) },
-    { k: 'filters', l: 'Filters changed', t: 'chips', multi: 1, o: OPT.filters, show: (v) => !R.isNoShow(v) },
+    { t: 'section', k: 'secFilters', l: 'Filters', hint: 'Booking intervals are a guide — decide by what you see. PP brown/black → replace now.', show: (v) => !R.isNoShow(v) },
+    { k: 'filters', l: 'Filters changed', t: 'chips', multi: 1, o: OPT.filters, show: (v) => !R.isNoShow(v), hint: S.settings.filterMode === 'Separate' ? '' : 'Filters go together: everything that falls due before the next change is done on this visit (pre-ticked).' },
     { k: 'ppColor', l: 'Old PP filter colour', t: 'chips', o: OPT.ppColor, show: (v) => !R.isNoShow(v) },
     { k: 'oldCollected', l: 'Old filters taken back?', t: 'chips', o: OPT.yesNo, show: (v) => !R.isNoShow(v) && (v.filters || []).length > 0 },
-    { k: 'oldCount', l: 'How many old filters', t: 'number', show: (v) => !R.isNoShow(v) && (v.filters || []).length > 0, hint: 'G-1 §2-2: one old filter back for each new one.' },
+    { k: 'oldCount', l: 'How many old filters', t: 'number', show: (v) => !R.isNoShow(v) && (v.filters || []).length > 0, hint: 'One old filter back for each new one.' },
     { t: 'section', k: 'secMeasure', l: 'Measurements', show: (v) => !R.isNoShow(v) },
     { k: 'tdsBefore', l: 'TDS before', t: 'number', show: (v) => !R.isNoShow(v) },
-    { k: 'tdsAfter', l: 'TDS after', t: 'number', hint: 'Required to complete a visit (G-1 §2-3).', show: (v) => !R.isNoShow(v) },
+    { k: 'tdsAfter', l: 'TDS after', t: 'number', hint: 'Required to complete a visit.', show: (v) => !R.isNoShow(v) },
     { k: 'flow', l: 'Flow (L/min)', t: 'number', step: 0.1, ph: 'e.g. 1.1', show: (v) => !R.isNoShow(v) },
     { k: 'parts', l: 'Parts used', t: 'counts', o: partsList, show: (v) => !R.isNoShow(v), hint: 'Tap a part once for each one used (tap again = 2). − takes one off. Counted off stock.' },
-    { k: 'issuedFrom', l: 'Parts came from', t: 'chips', o: ['my bag', 'shelf'], def: 'my bag', show: (v) => !R.isNoShow(v) && (v.parts || []).length > 0, hint: 'My bag = issued to me this morning (G-1 §5-3). Shelf = taken straight from stock.' },
+    { k: 'issuedFrom', l: 'Parts came from', t: 'chips', o: ['my bag', 'shelf'], def: 'my bag', show: (v) => !R.isNoShow(v) && (v.parts || []).length > 0, hint: 'My bag = issued to me this morning. Shelf = taken straight from stock.' },
     { k: 'partsUsed', l: 'Other parts / extra quantity', t: 'text', ph: 'e.g. O-ring ×2, fitting ×1', show: (v) => !R.isNoShow(v) },
-    { k: 'sanitised', l: 'Pipes sanitised on this visit?', t: 'chips', o: OPT.yesNo, hint: 'E-2: full pipe sanitisation every 3 months (quarterly).', show: (v) => !R.isNoShow(v) },
+    { k: 'sanitised', l: 'Pipes sanitised on this visit?', t: 'chips', o: OPT.yesNo, hint: 'Full pipe sanitisation every 3 months.', show: (v) => !R.isNoShow(v) },
+    { t: 'section', k: 'secCust', l: 'For the customer (visit note)', hint: 'Tap what you did — it goes on the visit note in English and Nepali. Anything else: one line in English or Nepali; the other language is added once the visit reaches the server.', show: (v) => !R.isNoShow(v) }, /* v0.17.0 (8) */
+    { k: 'custPick', l: 'What we did', t: 'chips', multi: 1, noi18n: 1, o: () => visitLines().map((x) => x.en), show: (v) => !R.isNoShow(v) }, /* the button words are data (Settings) — not run through the UI dictionary */
+    { k: 'custNote', l: 'Anything else for the customer', t: 'text', ph: 'English or नेपाली — one short line', show: (v) => !R.isNoShow(v) },
     { t: 'section', l: 'Next & who' },
-    { k: 'nextVisitDate', l: 'Next visit date', t: 'date', hint: 'Required to complete (G-1 §2-3). Suggested: monthly for 6 months after install, then every 3 months.', show: (v) => !R.isNoShow(v) },
+    { k: 'nextVisitDate', l: 'Next visit date', t: 'date', hint: 'Required to complete. Suggested: monthly for 6 months after install, then every 3 months.', show: (v) => !R.isNoShow(v) },
     { k: 'technician', l: 'Technician', t: 'chips', o: techNames, req: 1, def: myName },
-    { k: 'transport', l: 'Transport', t: 'chips', o: OPT.transport, def: 'Motorbike' },
     { k: 'durationMin', l: 'Time at the house (minutes)', t: 'number', show: (v) => !R.isNoShow(v) },
-    { k: 'filterCost', l: 'Filter cost (NPR)', t: 'number', def: 0, show: (v) => !R.isNoShow(v) },
     { t: 'section', k: 'secSign', l: 'Customer signature', hint: 'Proof we were there — the customer signs with a finger (saved like a photo). No signature → say why.', show: (v) => !R.isNoShow(v) },
     { k: 'signName', l: 'Signed by (name)', t: 'text', show: (v) => !R.isNoShow(v) },
     { k: 'sign', l: '', t: 'sign', show: (v) => !R.isNoShow(v) },
     { k: 'noSign', l: 'No signature — why?', t: 'chips', o: OPT.noSign, show: (v) => !R.isNoShow(v) && !v.sign },
-    { t: 'section', l: 'Photos', hint: 'G-1 §2-1 filter change: old filter · device after · TDS after. Repair: fault close-up · working after.' },
+    { t: 'section', l: 'Photos', hint: 'Filter change: old filter · device after · TDS after. Repair: fault close-up · working after.' },
     { k: 'photos', l: 'Photos', t: 'photos' },
     { k: 'notes', l: 'Notes', t: 'textarea', ph: 'complaints, symptoms, anything to remember' },
   ],
-  prefill(p) { const c = S.D.customers.get(p.cid); return { customerId: p.cid || '', nextVisitDate: c ? R.suggestNextVisit(c.installDate, today()) : '', retryDate: R.addDays(today(), 1), signName: c ? c.name || '' : '' }; },
+  info(v) {
+    const x = v.customerId ? model().cust.get(v.customerId) : null; if (!x) return '';
+    const due = (x.fd || []).filter((f) => f.status === 'overdue' || f.status === 'due').map((f) => `${f.type}${f.due ? ' (' + f.due + ')' : ''}`);
+    const last = arr('visits').filter((q) => q.customerId === x.c.id && q.status && String(q.status).includes('Completed')).sort((a, b) => String(b.date).localeCompare(String(a.date)))[0];
+    const line = (s) => `<div>${s}</div>`;
+    return line(`<b>${esc('Due at this house')}</b>: ${due.length ? esc(due.join(' · ')) : esc('no filter due')}`) + (last ? line(`${esc('Last visit')} ${esc(last.date)} · ${esc(last.visitType || '')}${last.ppColor ? ' · PP ' + esc(last.ppColor) : ''}${last.tdsAfter ? ' · TDS ' + esc(last.tdsAfter) : ''}${esc(last.notes ? ' · ' + String(last.notes).slice(0, 60) : '')}`) : line(esc('No completed visit yet'))) + (x.led && x.led.overdue ? line(`<span style="color:var(--bad)">${esc('Overdue ' + R.npr(x.led.overdue) + ' — ask for it while you are there')}</span>`) : '');
+  },
+  prefill(p) { const c = S.D.customers.get(p.cid); const x = p.cid ? model().cust.get(p.cid) : null; const due = x ? (x.fb && x.fb.date <= R.addDays(today(), 14) ? x.fb.types : (x.fd || []).filter((f) => f.status === 'overdue').map((f) => f.type)) : []; /* v0.15: together → the whole batch */ return { customerId: p.cid || '', nextVisitDate: c ? R.suggestNextVisit(c.installDate, today()) : '', retryDate: R.addDays(today(), 1), signName: c ? c.name || '' : '', ...(due.length ? { filters: due, visitType: 'Filter change' } : {}) }; },
   check(v, confirmed) {
     const errs = {}, warns = {};
     if (!v.customerId || !S.D.customers.has(v.customerId)) errs.customerId = 'Choose the customer.';
     need(errs, v, 'date'); need(errs, v, 'visitType'); need(errs, v, 'status'); need(errs, v, 'technician', 'Who did the visit?');
     const done = isDone(v.status);
     if (done && v.visitType === 'Filter change' && !(v.filters || []).length) errs.filters = 'Which filters did you change?';
-    if (done && v.tdsAfter === null) errs.tdsAfter = 'Measure TDS after (G-1 §2-3).';
-    if (done && !v.nextVisitDate) errs.nextVisitDate = 'Enter the next visit date (G-1 §2-3).';
+    if (done && v.tdsAfter === null) errs.tdsAfter = 'Measure TDS after.';
+    if (done && !v.nextVisitDate) errs.nextVisitDate = 'Enter the next visit date.';
     if (!inRange(v.tdsBefore, 0, 5000)) errs.tdsBefore = 'Check the TDS number (0–5000).';
     if (!inRange(v.tdsAfter, 0, 5000)) errs.tdsAfter = 'Check the TDS number (0–5000).';
     if (!inRange(v.flow, 0, 10)) errs.flow = 'Check the flow (0–10 L/min).';
     else if (v.flow !== null && v.flow > UV_FLOW_LIMIT && !confirmed) warns.flow = `Above ${UV_FLOW_LIMIT} L/min the UV margin is thin — check the flow restrictor.`;
     if (!inRange(v.oldCount, 0, 20)) errs.oldCount = 'Check this number (0–20).';
     const nf = (v.filters || []).length;
-    if (nf && !confirmed && (v.oldCollected !== 'Yes' || (v.oldCount !== null && v.oldCount < nf))) warns.oldCount = `G-1 §2-2: ${nf} new filter(s) → ${nf} old filter(s) back.`;
-    if (['Brown', 'Black'].includes(v.ppColor) && !(v.filters || []).includes('PP') && !confirmed) warns.ppColor = `PP is ${v.ppColor.toLowerCase()} — E-2 says replace now.`;
+    if (nf && !confirmed && (v.oldCollected !== 'Yes' || (v.oldCount !== null && v.oldCount < nf))) warns.oldCount = `${nf} new filter(s) → ${nf} old filter(s) back.`;
+    if (['Brown', 'Black'].includes(v.ppColor) && !(v.filters || []).includes('PP') && !confirmed) warns.ppColor = `PP is ${v.ppColor.toLowerCase()} — replace it now.`;
     if (!inRange(v.durationMin, 0, 600)) errs.durationMin = 'Check the minutes (0–600).';
     if (R.isNoShow(v)) {
       if (!v.noShowReason) errs.noShowReason = 'What happened at the door?';
@@ -843,20 +918,22 @@ FORMS.visit = {
       else if (v.retryDate <= v.date) errs.retryDate = 'Pick a day after the visit.';
       if (!inRange(v.waitedMin, 0, 240)) errs.waitedMin = 'Check the minutes (0–240).';
     }
-    if (!inRange(v.filterCost, 0, 100000)) errs.filterCost = 'Check the cost.';
     if (done && !v._edit && !v.sign && !v.noSign && !confirmed && S.settings.signAsk === 'Yes') warns.noSign = 'No signature — ask the customer to sign, or say why.';
-    if (done && !v._edit) { const np = S.formPhotos.length; if (!np) errs.photos = 'G-1 §2-1: a visit without photos does not count as done.'; else if (np < 3 && !confirmed && ['Filter change', 'Repair'].includes(v.visitType)) warns.photos = `G-1 §2-1 lists 3 photos for this visit — you have ${np}.`; }
+    if (done && !v._edit) { const np = S.formPhotos.length; if (!np) errs.photos = 'A visit without photos does not count as done.'; else if (np < 3 && !confirmed && ['Filter change', 'Repair'].includes(v.visitType)) warns.photos = `3 photos for this visit — you have ${np}.`; }
     return { errs, warns };
   },
   save(v, id, isNew) {
     const c = S.D.customers.get(v.customerId);
     const sig = v.sign; const data = { ...v, customerCode: c.code || '', customerName: c.name || '', oldCollected: v.oldCollected === 'Yes' ? true : v.oldCollected === 'No' ? false : null };
     delete data.sign; if (sig) { data.signed = true; data.noSign = ''; } else if (isNew || !(S.D.visits.get(id) || {}).signed) data.signed = false; /* an edit without a new signature keeps the old one */
+    { const VL = visitLines(); const prev = S.D.visits.get(id) || {}; data.custPick = (v.custPick || []).filter((en) => typeof en === 'string').slice(0, 6); /* v0.17.0 (8): both languages saved with the visit — a later edit of the buttons does not change old notes */
+      data.custLines = data.custPick.map((en) => { const q = VL.find((x) => x.en === en) || (Array.isArray(prev.custLines) ? prev.custLines.find((x) => x && x.en === en) : null); return { en, ne: q ? q.ne || '' : '' }; });
+      data.custNote = String(v.custNote || '').trim().slice(0, 200); if (!isNew && String(prev.custNote || '') !== data.custNote) data.custNoteTr = null; } /* a changed line waits for its new translation */
     if (isNew) { const e = omwFor(v.customerId, v.date); if (e) { data.omwAt = new Date(e.at).toISOString(); data.omwEta = e.eta; } } // "on my way" sent that day → stamped for the wasted-trip page
     const ok = save(`visits/${id}`, data, isNew);
     if (isNew && ok) omwClear(v.customerId);
     const np = savePhotos(v.customerId, `visits/${id}`, v.visitType === 'Repair' ? 'repair' : 'visit') + (ok ? saveSign(v.customerId, `visits/${id}`, sig, v.signName) : 0);
-    return { ok, np, go: ['customers', 'detail', { id: v.customerId }] };
+    return { ok, np, go: ['customers', 'detail', { id: v.customerId, vrep: id }] };
   },
 };
 FORMS.payment = {
@@ -894,7 +971,7 @@ FORMS.payment = {
     if (v.amount === null || !inRange(v.amount, 1, 200000)) errs.amount = 'Enter the amount.';
     if (!inRange(v.discount, 0, 50000)) errs.discount = 'Check the discount.';
     if (v._edit && !isBoss()) { const old = S.D.payments.get(v._id) || {}; for (const k of ['amount', 'date', 'type', 'method', 'discount', 'customerId']) if (String(old[k] ?? '') !== String(v[k] ?? '') && !(old[k] == null && (v[k] === '' || v[k] === null))) errs[k === 'customerId' ? 'customerId' : k] = 'A saved payment can only be changed by Jun — tell him what is wrong.'; }
-    if (v.method === 'Cash' && !mayTakeCash() && !confirmed) warns.method = 'G-1 §1-1: only Tara may take cash. Save anyway only if Tara took it.';
+    if (v.method === 'Cash' && !mayTakeCash() && !confirmed) warns.method = 'Only Tara may take cash. Save anyway only if Tara took it.';
     const x = v.customerId && model().cust.get(v.customerId);
     if (x && v.amount && !confirmed && v.type === 'Monthly subscription') { const owed = x.led.overdue > 0 ? x.led.overdue : x.led.nextBill ? x.led.nextBill.amount - x.led.nextBill.paid : 0; if (owed > 0 && v.amount > owed * 3) warns.amount = `That is more than 3 months (${R.npr(owed)} owed now). Prepayment is fine — check the number.`; }
     if (v.type === 'Referral credit' && !v.referralFor) errs.referralFor = 'Which new customer is this for?';
@@ -915,12 +992,12 @@ FORMS.request = {
     { k: 'type', l: 'Problem', t: 'chips', o: OPT.reqType, req: 1 },
     { k: 'priority', l: 'Priority', t: 'chips', o: OPT.priority, req: 1, def: 'Normal' },
     { k: 'status', l: 'Status', t: 'chips', o: OPT.reqStatus, req: 1, def: 'Received' },
-    { k: 'receivedAt', l: 'Received at', t: 'datetime-local', req: 1, def: nowLocal, hint: 'G-1 §2-4: office hours → reply within 2 h, visit same or next day.' },
+    { k: 'receivedAt', l: 'Received at', t: 'datetime-local', req: 1, def: nowLocal, hint: 'Office hours → reply within 2 h, visit same or next day.' },
     { k: 'description', l: 'What the customer said', t: 'textarea', req: 1 },
     { k: 'agent', l: 'Handled by', t: 'chips', o: techNames, def: myName },
     { k: 'resolution', l: 'What we did', t: 'textarea', show: (v) => v.status === 'Done' || v.status === 'In progress' },
     { k: 'doneDate', l: 'Done on', t: 'date', show: (v) => v.status === 'Done', def: today },
-    { k: 'ourFault', l: 'Whose fault was it?', t: 'chips', o: ['Our unit / our work', 'No — power, water supply or the customer'], def: 'Our unit / our work', show: (v) => v.status === 'Done' && R.REPAIR.types.includes(v.type), hint: 'Billing goes on. Not fixed within 7 days of the report → every day from the report comes off the next bill (Jun 2026-09-29).' },
+    { k: 'ourFault', l: 'Whose fault was it?', t: 'chips', o: ['Our unit / our work', 'No — power, water supply or the customer'], def: 'Our unit / our work', show: (v) => v.status === 'Done' && R.REPAIR.types.includes(v.type), hint: 'Billing goes on. Not fixed within 7 days of the report → every day from the report comes off the next bill.' },
   ],
   prefill(p) { return { customerId: p.cid || '', type: p.type || '' }; },
   check(v) {
@@ -1013,9 +1090,9 @@ FORMS.checkin = {
   col: 'checkins', title: 'Check-in call', icon: '📞',
   spec: () => [
     custPicker,
-    { k: 'kind', l: 'Which call', t: 'chips', o: OPT.checkinKind, req: 1 },
+    { k: 'kind', l: 'Which call', t: 'chips', o: OPT.checkinKind, lbl: OPT.checkinKindLabel, req: 1 },
     { k: 'date', l: 'Date', t: 'date', req: 1, def: today },
-    { k: 'by', l: 'Called by', t: 'chips', o: () => [...techNames(), 'Sister (happy call)'], req: 1, def: myName },
+    { k: 'by', l: 'Called by', t: 'chips', o: techNames, req: 1, def: myName },
     // v0.9 #1 payment chase: how, who answered, and the day they will pay
     { k: 'channel', l: 'How', t: 'chips', o: R.CHASE_CHANNELS, req: 1, def: 'Phone', show: isChase },
     { k: 'reached', l: 'Did you reach them?', t: 'chips', o: R.REACHED, req: 1, show: isChase },
@@ -1044,7 +1121,7 @@ FORMS.checkin = {
       if (v.promiseAmount !== null && v.promiseAmount !== undefined && !(v.promiseAmount >= 0)) errs.promiseAmount = 'Amount cannot be negative.';
     } else {
       need(errs, v, 'result');
-      if (v.result === 'Issue found' && !v.notes) errs.notes = 'Write the issue (G-1 §3-2: complaint → book a visit).';
+      if (v.result === 'Issue found' && !v.notes) errs.notes = 'Write the issue — a complaint means a visit gets booked.';
     }
     return { errs, warns };
   },
@@ -1073,7 +1150,7 @@ FORMS.stock = {
   col: 'stockMoves', title: 'Stock movement', icon: '📦',
   spec: () => [
     { k: 'item', l: 'Item', t: 'chips', o: stockItems, req: 1 },
-    { k: 'type', l: 'Movement', t: 'chips', o: OPT.stockType, req: 1, def: 'In', hint: 'Installs and filter changes are subtracted automatically. Issue = a person takes parts for the day, Return = brings back what is left (G-1 §5-3).' },
+    { k: 'type', l: 'Movement', t: 'chips', o: OPT.stockType, req: 1, def: 'In', hint: 'Installs and filter changes are subtracted automatically. Issue = a person takes parts for the day, Return = brings back what is left.' },
     { k: 'person', l: 'Person', t: 'chips', o: techNames, show: (v) => ['Issue', 'Return'].includes(v.type) },
     { k: 'signName', l: 'Signed by (name)', t: 'text', show: (v) => ['Issue', 'Return'].includes(v.type) },
     { k: 'sign', l: 'Signed receipt', t: 'sign', show: (v) => ['Issue', 'Return'].includes(v.type) },
@@ -1192,7 +1269,7 @@ FORMS.contract = {
     }
     if (v.kind === 'Transfer to a new holder') return line('🔴 Draft §2.11 (transfer / succession) is still [TBC] with the lawyer — this only records it. Saving puts the new name and phone on the customer; the old ones stay in this record.');
     const LS = R.lostSettlement(c, model().ledgers.get(c.id), v.lostDate || v.date);
-    return line(`Settlement (Jun 2026-09-29): early-ending charge ${R.npr(LS.fee)} + the unit's value ${R.npr(LS.residual)} − deposit paid ${R.npr(LS.deposit)} = ${R.npr(LS.total)}`) + line(`Draft §2.5(b): the customer tells us within ${R.CONTRACT.lostNotifyDays} days.`) + (c.deviceSerial ? line(`Saving marks the device ${c.deviceSerial} as “Lost / stolen”.`) : '');
+    return line(`Settlement: early-ending charge ${R.npr(LS.fee)} + the unit's value ${R.npr(LS.residual)} − deposit paid ${R.npr(LS.deposit)} = ${R.npr(LS.total)}`) + line(`Draft §2.5(b): the customer tells us within ${R.CONTRACT.lostNotifyDays} days.`) + (c.deviceSerial ? line(`Saving marks the device ${c.deviceSerial} as “Lost / stolen”.`) : '');
   },
   prefill(p) { return { customerId: p.cid || '', kind: p.kind || '' }; },
   check(v) {
@@ -1240,7 +1317,7 @@ FORMS.screening = {
     { k: 'date', l: 'Date', t: 'date', req: 1, def: today },
     { t: 'section', l: 'Home', hint: '🔴 First-guess rules (G-1 has no sign-up rule yet) — the verdict only advises; you decide at the end.' },
     { k: 'housing', l: 'Own house or rent?', t: 'chips', o: ['Own house', 'Renting'], req: 1 },
-    { k: 'mount', l: 'Unit on the wall or on a stand?', t: 'chips', o: ['Stand', 'Wall'], def: 'Stand', show: (v) => v.housing === 'Renting', hint: 'Wall = drilling. Renting + wall needs the landlord\'s written OK (Civil Code §396(1)).' },
+    { k: 'mount', l: 'Unit on the wall or on a stand?', t: 'chips', o: ['Stand', 'Wall'], def: 'Stand', show: (v) => v.housing === 'Renting', hint: 'Wall = drilling. Renting + wall needs the landlord\'s written OK.' },
     { k: 'landlordOk', l: 'Landlord agreed in writing?', t: 'chips', o: OPT.yesNo, show: (v) => v.housing === 'Renting' && v.mount === 'Wall' },
     { k: 'landlordName', l: 'Landlord — name', t: 'text', show: (v) => v.housing === 'Renting' },
     { k: 'landlordPhone', l: 'Landlord — mobile', t: 'tel', ph: '98XXXXXXXX', show: (v) => v.housing === 'Renting' },
@@ -1252,12 +1329,12 @@ FORMS.screening = {
     { k: 'waterSpend', l: 'Spent on drinking water a month (NPR)', t: 'number' },
     { k: 'income', l: 'Main income', t: 'chips', o: R.SCREEN_INCOME, hint: 'Only the kind — do not ask the amount.' },
     { k: 'remitMonths', l: 'Months the money usually comes', t: 'text', ph: 'e.g. Baisakh, Kartik', show: (v) => v.income === 'Money from abroad', hint: 'For the bill day — not a reason to hold.' },
-    { k: 'cashDay1', l: 'First-day 4,900 in cash on the install day?', t: 'chips', o: OPT.yesNo, req: 1, hint: 'No = hold. The first day is not split, owed or waived (Jun 2026-09-29).' },
+    { k: 'cashDay1', l: 'First-day 4,900 in cash on the install day?', t: 'chips', o: OPT.yesNo, req: 1, hint: 'No = hold. The first day is not split, owed or waived.' },
     { t: 'section', l: 'Checks' },
     { k: 'phone2', l: 'Second phone (family)', t: 'tel' },
     { k: 'phone2Who', l: 'Whose is it', t: 'text', ph: 'e.g. husband, son abroad' },
     { k: 'referee', l: 'Referee — name · relation · phone', t: 'text', ph: 'a neighbour, ward person or relative', hint: 'Needed when there is only one phone, or renting here under a year.' },
-    { k: 'consentSigned', l: 'Consent form signed?', t: 'chips', o: OPT.yesNo, hint: 'Needed before we tell a family number or referee about a late bill (Privacy Act §12).' },
+    { k: 'consentSigned', l: 'Consent form signed?', t: 'chips', o: OPT.yesNo, hint: 'Needed before we tell a family number or referee about a late bill.' },
     { k: 'verifyBy', l: 'Check call made by', t: 'text', ph: 'someone other than the seller — usually Tara' },
     { k: 'verifyDate', l: 'Check call on', t: 'date' },
     { k: 'idSeen', l: 'Citizenship card / ID seen?', t: 'chips', o: OPT.yesNo, req: 1, hint: 'Tick only — do not write the number or photograph it.' },
@@ -1347,6 +1424,34 @@ FORMS.claim = {
     return { ok, np, go: ['today', 'list', { list: 'claims' }] };
   },
 };
+// v0.15 milestone boards (Jun 10/3 "게이트 보드·선적 트래커 = 관제실 카테고리 · 등급 칸"): one kind of board, many boards.
+// An item = what · who holds the ball · state · since when · due · how sure the date is (🟢🟡🔴) · source · note. Values live here, never in code.
+export const MS_WHO = ['Us', 'Ministry', 'Lawyer', 'Supplier', 'Forwarder', 'Bank', 'CA', 'Immigration', 'Other'];
+export const MS_STATE = ['Todo', 'Waiting', 'Blocked', 'Done'];
+export const MS_GRADE = ['🟢 measured', '🟡 second-hand', '🔴 guess'];
+export const msBoards = () => [...new Set(arr('milestones').map((x) => x.board || 'Board'))];
+FORMS.milestone = {
+  col: 'milestones', title: 'Milestone', icon: '🧱',
+  spec: () => [
+    { k: 'board', l: 'Board', t: 'text', req: 1, ph: 'e.g. Licences · Shipment', hint: msBoards().length ? 'Type a new name for a new board.' : 'Type a name — a board is made from its first item.' }, /* the boards are the tabs on the page */
+    { k: 'title', l: 'What', t: 'text', req: 1, ph: 'e.g. Import licence (EXIM code)' },
+    { k: 'who', l: 'Who holds the ball', t: 'chips', o: MS_WHO, req: 1, def: 'Us' },
+    { k: 'whoName', l: 'Name (optional)', t: 'text', ph: 'the officer · the forwarder · the lawyer' },
+    { k: 'state', l: 'State', t: 'chips', o: MS_STATE, req: 1, def: 'Todo' },
+    { k: 'since', l: 'With them since', t: 'date', show: (v) => v.state === 'Waiting' || v.state === 'Blocked', def: today, hint: 'The board counts the days from here.' },
+    { k: 'due', l: 'Due / expected', t: 'date' },
+    { k: 'grade', l: 'How sure is that date', t: 'chips', o: MS_GRADE, def: MS_GRADE[2] },
+    { k: 'src', l: 'Source', t: 'text', ph: 'file:line · who said it · link' },
+    { k: 'note', l: 'Note', t: 'textarea' },
+    { k: 'order', l: 'Order on the board', t: 'number', def: 10, hint: 'Smaller = higher.' },
+  ],
+  prefill(p) { return { board: p.board && p.board !== '__new__' ? p.board : (msBoards()[0] || ''), since: today(), grade: MS_GRADE[2], order: 10 * (arr('milestones').filter((x) => (x.board || 'Board') === p.board).length + 1) }; },
+  check(v) { const errs = {}; need(errs, v, 'board', 'Which board?'); need(errs, v, 'title', 'What is it?'); need(errs, v, 'who', 'Who has it?'); need(errs, v, 'state'); if (!inRange(v.order, 0, 9999)) errs.order = 'A number.'; return { errs, warns: {} }; },
+  save(v, id, isNew) {
+    const d = { ...v, board: String(v.board || '').trim().slice(0, 60), title: String(v.title || '').trim().slice(0, 160), doneDate: v.state === 'Done' ? (v.doneDate || today()) : '', by: myName() };
+    const ok = save(`milestones/${id}`, d, isNew); return { ok, np: 0, go: ['status', S.desk ? 'board' : 'status', { b: d.board }] };
+  },
+};
 // v0.9 #7 tools — who holds it, its state, repairs (G-1 §5-3: carelessness = the person pays half)
 FORMS.tool = {
   col: 'tools', title: 'Tool', icon: '🧰', perm: 'stock',
@@ -1357,14 +1462,14 @@ FORMS.tool = {
     { k: 'cost', l: 'Cost (NPR)', t: 'number' },
     { k: 'holder', l: 'Who has it', t: 'chips', o: () => [...techNames(), 'Office'], req: 1, def: 'Office' },
     { k: 'status', l: 'State', t: 'chips', o: R.TOOL_STATUS, req: 1, def: 'OK' },
-    { k: 'fault', l: 'How it happened', t: 'chips', o: R.TOOL_FAULT, show: (v) => ['Broken', 'Lost', 'Needs repair'].includes(v.status) },
+    { k: 'fault', l: 'How it happened', t: 'chips', o: R.TOOL_FAULT, lbl: { [R.TOOL_FAULT[1]]: 'Carelessness (person pays half)' }, show: (v) => ['Broken', 'Lost', 'Needs repair'].includes(v.status) },
     { k: 'repairCost', l: 'Repair or replacement cost (NPR)', t: 'number', show: (v) => ['Broken', 'Lost', 'Needs repair'].includes(v.status) },
     { k: 'calibrated', l: 'Last checked / calibrated', t: 'date', hint: 'For meters (TDS, flow): the day it was checked against a known value.' },
     { k: 'notes', l: 'Notes', t: 'textarea' },
   ],
   check(v) {
     const errs = {}, warns = {}; if (!v.name || v.name.length < 2) errs.name = 'Name the tool.'; need(errs, v, 'holder'); need(errs, v, 'status');
-    if (['Broken', 'Lost'].includes(v.status) && !v.fault) errs.fault = 'How did it happen? (G-1 §5-3)';
+    if (['Broken', 'Lost'].includes(v.status) && !v.fault) errs.fault = 'How did it happen?';
     if (!inRange(v.cost, 0, 1000000)) errs.cost = 'Check the cost.'; if (!inRange(v.repairCost, 0, 1000000)) errs.repairCost = 'Check the cost.';
     return { errs, warns };
   },
@@ -1414,9 +1519,9 @@ FORMS.waterTest = {
   col: 'waterTests', title: 'Raw-water vial', icon: '🧫',
   spec: () => [
     custPicker,
-    { k: 'sampledDate', l: 'Filled on', t: 'date', req: 1, def: today, hint: 'Kitchen tap, before the unit is connected. Keep the vial warm (35 °C pocket incubator).' },
+    { k: 'sampledDate', l: 'Filled on', t: 'date', req: 1, def: today, hint: 'Kitchen tap, before the unit is connected. Keep the vial indoors at room temperature and read it after 2 days.' },
     { k: 'readDate', l: 'Read on', t: 'date' },
-    { k: 'result', l: 'Colour', t: 'chips', o: R.VIAL_RESULTS, hint: 'Blue = E. coli · pink = coliforms · no change = none seen. 🚨 Our own check — never tell the customer the water is safe or unsafe from it.' },
+    { k: 'result', l: 'Colour', t: 'chips', o: R.VIAL_RESULTS, hint: 'Black = faecal contamination · no change = none seen. 🚨 Our own check — never tell the customer the water is safe or unsafe from it.' },
     { k: 'photos', l: 'Photo of the vial', t: 'photos' },
     { k: 'notes', l: 'Notes', t: 'textarea' },
   ],
@@ -1512,15 +1617,31 @@ FORMS.event = {
 };
 export { FORMS };
 
+// v0.11.1 (#1) drafts: a half-written form survives a tab tap, a phone call or iOS closing the app — kept on the phone per form, 3 days
+const DRAFT_KEY = (form) => 'kf_draft_' + form;
+export function draftGet(form) { const d = lsGet(DRAFT_KEY(form), null); return d && d.v && Date.now() - d.t < 3 * 864e5 ? d : null; }
+export function draftClear(form) { try { localStorage.removeItem(DRAFT_KEY(form)); } catch (e) {} }
+let draftT = 0;
+export function draftSave(form) {
+  if (!form || form.dataset.id || S.noDraft || form.dataset.form === 'login') return;
+  clearTimeout(draftT); draftT = setTimeout(() => {
+    const Fm = FORMS[form.dataset.form]; if (!Fm || !form.isConnected) return;
+    const v = readForm(form, Fm.spec()); delete v.sign;
+    if (!Object.values(v).some((x) => (Array.isArray(x) ? x.length : x !== '' && x !== null && x !== undefined))) return;
+    lsSet(DRAFT_KEY(form.dataset.form), { v, t: Date.now() });
+  }, 300);
+}
 function formHtml(p) {
   const F = FORMS[p.form]; if (!F) return '<div class="card">Unknown form</div>';
   const existing = p.id ? S.D[F.col].get(p.id) : null;
-  const pre = existing ? { ...existing } : (F.prefill ? F.prefill(p) : {});
+  const draft = !existing && !S.noDraft ? draftGet(p.form) : null;
+  const pre = existing ? { ...existing } : { ...(F.prefill ? F.prefill(p) : {}), ...(draft ? draft.v : {}) };
   if (F.col === 'customers' && existing && isBoss()) pre.privateNotes = S.privCache && S.privCache[p.id] !== undefined ? S.privCache[p.id] : '';
   const spec = F.spec();
   return `<button class="back" data-back>‹ Back</button><h1>${F.icon} ${esc(existing ? (F.edit ? F.title : 'Edit ' + F.title.toLowerCase()) : F.title)}</h1>
     <div class="muted"><span style="color:var(--bad)">*</span> required${existing ? ' · editing a saved record' : ''}</div>
     <form class="card" id="theForm" data-form="${p.form}" data-id="${esc(p.id || '')}" novalidate>
+      ${draft ? `<div class="draftbar">📝 <span>Draft from ${esc(new Date(draft.t).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }))} restored</span><button type="button" class="btn small ghost" data-act="draftClear" style="margin-left:auto">Start fresh</button></div>` : ''}
       ${spec.map((f) => field(f, pre[f.k])).join('')}
       <button class="btn" type="submit" id="saveBtn">Save</button>
     </form>`;
@@ -1545,7 +1666,9 @@ function submitForm(form) {
   delete v._edit; delete v._id;
   const id = editId || newId(F.col);
   const r = F.save(v, id, isNew);
-  toast(r.ok ? `🟡 Saved on phone${r.np ? ` (+${r.np} photo)` : ''} — sends when online` : '🔴 Could not save — write it on paper');
+  if (isNew && r.ok) draftClear(form.dataset.form);
+  if (r.ok && r.go && r.go[2]) { const g = r.go[2]; if (g.receipt) prerenderCard('receipt', g.receipt); else if (g.vrep) prerenderCard('visit', g.vrep); else if (g.inst) prerenderCard('install', g.inst); } /* v0.16 #4: the card is ready before the button is tapped */
+  toast(r.ok ? (navigator.onLine && !DEMO ? `🟢 Saved${r.np ? ` (+${r.np} photo)` : ''} — sending now` : `🟡 Saved on phone${r.np ? ` (+${r.np} photo)` : ''} — sends when online`) : '🔴 Could not save — write it on paper');
   if (S.desk && S.drawer) {
     // Desk: the finished form is dropped (Back must not return to it); the result opens where the form was.
     S.drawer = null; const [, scr, prm] = r.go;
@@ -1573,6 +1696,8 @@ export function go(tab, screen, params, isBack) {
   if (S.desk && next.screen === 'report') { closeDrawer(true); }
   if (!isBack && S.route && S.route.screen !== 'form') { history_.push(S.route); pushNav(); }
   if (history_.length > 40) history_.shift();
+  if (S.route && S.route.screen === 'form' && next.screen !== 'form' && !S.desk) { const fm = S.route.params && S.route.params.form; if (fm && !S.route.params.id && draftGet(fm)) toast('📝 Draft kept — open the same form again to continue'); } /* v0.11.1 (#1) */
+  S.navDir = isBack ? 'back' : S.route && next.screen === next.tab && S.route.tab !== next.tab ? 'tab' : next.screen === next.tab ? 'tab' : 'fwd'; /* v0.11.1 motion: which way the next screen slides in */
   S.route = next;
   if (S.route.screen === 'form') S.formPhotos = [];
   render(true);
@@ -1652,7 +1777,7 @@ export function render(fresh) {
   const tb = tabs.querySelector('[data-tab="today"] .badge'); tb.textContent = badge; tb.classList.toggle('hidden', !badge);
   // language switch on every phone screen (Today has it in the header)
   v.innerHTML = (!['today', 'status'].includes(S.route.screen) ? `<div class="lang-float">🌐 ${langSeg()}</div>` : '') + screenHtml(S.route);
-  if (fresh) { v.classList.remove('view-enter'); void v.offsetWidth; v.classList.add('view-enter'); }
+  if (fresh) { v.classList.remove('view-enter', 'view-fwd', 'view-back'); void v.offsetWidth; v.classList.add('view-enter'); if (S.navDir === 'fwd') v.classList.add('view-fwd'); else if (S.navDir === 'back') v.classList.add('view-back'); S.navDir = ''; clearTimeout(S.enterT); S.enterT = setTimeout(() => v.classList.remove('view-enter', 'view-fwd', 'view-back'), 600); /* entrance classes go after the animation so a data refresh does not replay it */ }
   afterRender(v, S.route);
 }
 export function screenHtml(r) {
@@ -1687,16 +1812,23 @@ export function openDrawer(screen, params, mode = 'push') {
   if (mode === 'push') pushNav();
   paintDrawer(first ? '' : 'fwd', 0);
 }
-function drawerHead() { return `<button class="x" data-act="closeDrawer" title="Close (Esc)">✕</button>${S.drawerStack.length ? `<div class="crumbs">${S.drawerStack.slice(-3).map((d) => `<span>${esc(crumbOf(d))}</span>`).join('<i>›</i>')}<i>›</i></div>` : ''}`; }
+function deskTidy(dr) { /* v0.17.1 ④ Jun 10/4 "가로로 쭉 눌린거 하지말랬는데 새 이사는 아직도 이런데?": a list window's "＋ New …" goes to the top right at normal size (it was a 1,066-px bar under the list — v0.17.0 sized buttons on the page, not in the window) */
+  if (!S.desk || !dr) return; const pg = dr.querySelector('.dpage'); if (!pg || !/\bscr-(list|report)\b/.test(pg.className)) return;
+  const nb = [...pg.children].filter((e) => e.matches('.btn[data-go-form]') && !e.classList.contains('ghost') && !e.classList.contains('small')); if (!nb.length) return;
+  const h = pg.querySelector(':scope > h1'); if (!h) return; const bar = document.createElement('div'); bar.className = 'dp-acts';
+  const sub = h.nextElementSibling && h.nextElementSibling.classList.contains('muted') ? h.nextElementSibling : h; sub.after(bar); for (const b of nb) { b.classList.add('small'); bar.appendChild(b); }
+}
+function drawerHead() { return `<button class="x" data-act="closeDrawer" title="Close (Esc)">✕</button><button class="fx" data-act="drawerFull" title="Full width">⤢</button>${S.drawerStack.length ? `<div class="crumbs">${S.drawerStack.slice(-3).map((d) => `<span>${esc(crumbOf(d))}</span>`).join('<i>›</i>')}<i>›</i></div>` : ''}`; }
 function crumbOf(d) { if (d.screen === 'detail') { const c = S.D.customers.get(d.params.id); return c ? c.name : 'Customer'; } if (d.screen === 'form') return (FORMS[d.params.form] || {}).title || 'Form'; if (d.screen === 'list') return d.params.list || 'List'; return d.params.r || d.screen; }
 function paintDrawer(dir, scroll) {
   let dr = $('#drawer');
   if (!dr) { const bg = document.createElement('div'); bg.id = 'drawerBg'; bg.className = 'drawer-bg'; document.body.appendChild(bg); dr = document.createElement('div'); dr.id = 'drawer'; dr.className = 'drawer'; document.body.appendChild(dr); }
-  dr.innerHTML = drawerHead() + `<div class="dpage ${dir}">${screenHtml(S.drawer)}</div>`;
+  dr.classList.toggle('wide', ['list', 'report'].includes(S.drawer.screen) && !dr.classList.contains('full')); /* v0.15: centred modal — lists and reports get the wide one */
+  dr.innerHTML = drawerHead() + `<div class="dpage ${dir} scr-${esc(S.drawer.screen || '')}">${screenHtml(S.drawer)}</div>`; deskTidy(dr);
   dr.scrollTop = scroll || 0;
   afterRender(dr, S.drawer);
 }
-function refreshDrawer() { const dr = $('#drawer'); if (!dr || !S.drawer) return; const st = dr.scrollTop; dr.innerHTML = drawerHead() + `<div class="dpage">${screenHtml(S.drawer)}</div>`; dr.scrollTop = st; afterRender(dr, S.drawer); }
+function refreshDrawer() { const dr = $('#drawer'); if (!dr || !S.drawer) return; const st = dr.scrollTop; dr.innerHTML = drawerHead() + `<div class="dpage scr-${esc(S.drawer.screen || '')}">${screenHtml(S.drawer)}</div>`; deskTidy(dr); dr.scrollTop = st; afterRender(dr, S.drawer); }
 export function closeDrawer(silent) {
   if (!S.drawer) return; S.drawer = null; S.drawerStack = []; S.formPhotos = [];
   const bg = $('#drawerBg'), dr = $('#drawer'); if (bg) bg.remove(); if (dr) dr.remove();
@@ -1714,7 +1846,7 @@ function viewLogin() {
     <label for="lg_email">Email</label><div class="pwbox"><input id="lg_email" name="email" type="email" autocomplete="username" inputmode="email" value="${esc(lsGet('kf_login_email', ''))}"><div class="pwbtns"><button type="button" class="pwbtn" data-act="lgClear" data-for="lg_email" aria-label="Clear">✕</button></div></div>
     <label for="lg_pw">Password</label><div class="pwbox"><input id="lg_pw" name="pw" type="password" autocomplete="current-password"><div class="pwbtns"><button type="button" class="pwbtn" data-act="pwShow" aria-label="Show password">👁</button><button type="button" class="pwbtn" data-act="lgClear" data-for="lg_pw" aria-label="Clear">✕</button></div></div>
     <label class="chk-line"><input type="checkbox" id="lg_remember"${lsGet('kf_login_remember', true) ? ' checked' : ''}> <span>Remember my email</span></label>
-    <label class="chk-line"><input type="checkbox" id="lg_keep"${lsGet('kf_login_keep', true) ? ' checked' : ''}> <span>Keep me signed in on this phone</span></label>
+    <label class="chk-line"><input type="checkbox" id="lg_keep"${lsGet('kf_login_keep', true) ? ' checked' : ''}> <span>Keep me signed in on this phone</span></label><div class="hint">Keep it on for a work phone — off means the app cannot open offline after iPhone closes it.</div>
     <div class="hint">The app never stores your password. Let the phone save it (iPhone: Passwords).</div>
     <div class="err hidden" id="lgErr"></div>
     <button class="btn" type="submit">Sign in</button>
@@ -1743,7 +1875,11 @@ export function alertsHtml(m) {
   const col = { bad: 'var(--bad)', warn: 'var(--warn)', ok: 'var(--ok)', info: 'var(--brand)' };
   const link = (a) => (a.list ? `data-list="${a.list}"` : a.cal ? (S.desk ? `data-cal="${a.cal}"` : '') : a.side ? (S.desk ? `data-side="${a.side}"` : '') : `data-report="${a.report}"`);
   const btns = (a) => (S.desk && a.report !== 'diag' ? `<div class="snz" data-stop><button data-snooze="${esc(alertKey(a))}" data-days="1" title="Done for today">✓</button><button data-snooze="${esc(alertKey(a))}" data-days="3" title="Hide for 3 days">💤</button></div>` : '');
-  return (list.map((a) => `<div class="item" ${link(a)}><span class="dot" style="background:${col[a.lvl]}"></span><div class="main"><div class="t" style="white-space:normal">${a.ic} ${esc(a.t)}</div></div>${btns(a)}<div class="r">›</div></div>`).join('') || '<div class="empty">No alerts — all clear ✨</div>')
+  // v0.11.2 (#14) Jun: "카테고리별로 정리" — four groups, a coloured dot only for red
+  const CAT = [['money', 'Money', '💰🤝💵✋🧾🏦📅'], ['field', 'Field & customers', '📋🔧🧪📞🚪🛠️⏸️📜🚚🧫⚠️📍🧲🔎'], ['stock', 'Stock & devices', '📦🔩📮'], ['sys', 'System & office', '💾📱🔴🧭📑🏖️']];
+  const catOf = (a) => (CAT.find(([, , ics]) => ics.includes(a.ic)) || CAT[3])[0];
+  const row = (a) => `<div class="item" ${link(a)}><span class="dot" style="background:${a.lvl === 'bad' ? col.bad : 'var(--line)'}"></span><div class="main"><div class="t" style="white-space:normal;font-weight:${a.lvl === 'bad' ? 600 : 400}">${a.ic} ${esc(a.t)}</div></div>${btns(a)}<div class="r">›</div></div>`;
+  return (list.length ? CAT.map(([k, label]) => { const xs = list.filter((a) => catOf(a) === k); return xs.length ? `<div class="sec-mini">${esc(label)} · ${xs.length}</div>${xs.map(row).join('')}` : ''; }).join('') : '<div class="empty">No alerts — all clear ✨</div>')
     + (hidden ? `<div class="muted snz-foot">💤 ${hidden} hidden · <a href="#" data-act="unsnooze">show all</a></div>` : '');
 }
 export function statusCard() {
@@ -1751,9 +1887,10 @@ export function statusCard() {
   return `<div class="card"><div class="status"><span class="dot live ${s.c}" data-sync-dot></span><span data-sync-text>${esc(s.t)}</span></div>
     <div class="muted" style="margin-top:6px">${navigator.onLine ? 'Online' : 'Offline'} · last server contact ${esc(ago(S.lastServer))}</div></div>`;
 }
-export const tagList = (c) => String((c && c.tags) || '').split(',').map((s) => s.trim()).filter(Boolean).slice(0, 8);
+// v0.11 phone lists (Tara 2026-09-30 "too colourful · too bold"): grouped rows like the iPhone Settings app — a small coloured icon box, plain text, a number, › on the right
+export const rowsHtml = (groups) => groups.filter((g) => g.rows.length).map((g) => `${g.title ? `<div class="sec">${esc(g.title)}</div>` : ''}<div class="card flush rows">${g.rows.map((r) => `<button class="rowb ${r.tone || g.tone || ''}" ${r.attr}><span class="ric">${r.ic}</span><span class="rl">${esc(r.l)}${r.s ? `<small>${esc(r.s)}</small>` : ''}</span>${r.n !== undefined && r.n !== '' ? `<span class="rn">${r.n}</span>` : ''}${r.b ? `<span class="rb">${r.b}</span>` : ''}<span class="rc">›</span></button>`).join('')}</div>`).join('');
 export const cItem = (x, right) => `<div class="item" data-cust="${esc(x.c.id)}"><span class="dot ${x.dot}"></span><div class="main"><div class="t">${esc(custLabel(x.c))}${x.c._pending ? ' <span class="pill warn">on phone</span>' : ''}</div>
-  <div class="s">${esc(toleOf(x.c))} · Ward ${esc(x.c.ward || '–')}${x.led.overdue ? ` · <span style="color:var(--bad)">${R.npr(x.led.overdue)} due</span>` : ''}${tagList(x.c).length ? ' · ' + tagList(x.c).map((g) => '#' + esc(g)).join(' ') : ''}</div></div>${right ? `<div class="r">${right}</div>` : '<div class="r">›</div>'}</div>`;
+  <div class="s">${esc(toleOf(x.c))} · Ward ${esc(x.c.ward || '–')}</div></div>${right ? `<div class="r">${right}</div>` : x.led.overdue ? `<div class="r"><span class="pill bad">${R.npr(x.led.overdue)} due</span></div>` : '<div class="r">›</div>'}</div>`; /* v0.11.1 (#16): the overdue amount sits in the right cell instead of the end of a clipped line */
 
 function viewToday() {
   const m = model(); const t = m.t;
@@ -1762,7 +1899,7 @@ function viewToday() {
   const tiles = [
     ['collections', '💰', 'Collections', chase.length, late ? `${late} need a call/visit` : 'reminders', late ? 'bad' : chase.length ? 'warn' : 'ok'],
     ['visits', '🔧', 'Visits due', m.visitsDue.length, 'by tole', m.visitsDue.length ? 'warn' : 'ok'],
-    ['calls', '📞', 'Calls', m.calls.length, 'onboarding & happy calls', m.calls.length ? 'warn' : 'ok'],
+    ['calls', '📞', 'Calls', m.calls.length, 'day-7 calls', m.calls.length ? 'warn' : 'ok'],
     ['requests', '📋', 'Requests', m.openReq.length, reqLate ? `${reqLate} past reply time` : 'open', reqLate ? 'bad' : m.openReq.length ? 'warn' : 'ok'],
     ['tomorrow', '📅', 'Bills tomorrow', m.tomorrowBills.length, 'send reminders', ''],
     ['leads', '🧲', 'Leads to follow', m.leadsDue.length, 'follow-up due', m.leadsDue.length ? 'warn' : ''],
@@ -1770,14 +1907,17 @@ function viewToday() {
   const sec = (title, items, empty, list) => `<h2>${title}${list ? `<button class="btn small ghost" style="margin-left:auto" data-list="${list}">All</button>` : ''}</h2><div class="card flush">${items || `<div class="empty">${empty}</div>`}</div>`;
   const s = syncState(); const tones = { collections: 'tone-money', visits: 'tone-field', calls: 'tone-call', requests: 'tone-req', tomorrow: 'tone-bill', leads: 'tone-lead' };
   const hr = new Date().getHours(); const greet = hr < 12 ? 'Good morning' : hr < 17 ? 'Good afternoon' : 'Good evening';
+  // v0.11.1 (Jun 2026-10-01 "원래 그 화면이 우린 좋았음"): the v0.10 look is back — gradient card, three numbers, six tiles; the collections card below keeps its v0.11 shape
   return `<div class="hero">
     <div class="top"><div><div class="hello">${esc(greet)}, ${esc(myName() || 'team')}</div><div class="date">${esc(fmtDate(new Date(), { weekday: 'long', day: 'numeric', month: 'long' }))}</div></div>
       <div style="display:flex;flex-direction:column;align-items:flex-end;gap:6px">${langSeg()}<span class="syncpill"><span class="dot live ${s.c}" data-sync-dot></span><span data-sync-text>${esc(s.t)}</span></span></div></div>
-    <div class="stats"><button data-list="visits"><b>${m.visitsDue.length}</b><span>Visits due</span></button><button data-list="collections"><b>${chase.length}</b><span>To collect</span></button><button data-list="calls"><b>${m.calls.length}</b><span>Calls</span></button></div>
+    <div class="stats"><button data-list="visits"><b>${m.visitsDue.length}</b><span>Visits due</span></button><button data-list="collections"><b>${chase.length}</b><span>${late ? `To collect · ${late} late` : 'To collect'}</span></button><button data-list="calls"><b>${m.calls.length}</b><span>Calls</span></button></div>
     <button class="cta" data-tab-go="route">🗺️ Open today's route</button>
+    <button type="button" class="memo-btn${lsGet('kf_memo', '') ? ' has' : ''}" data-act="memoToggle" title="Memo">📝 Memo${lsGet('kf_memo', '') ? ' ·' : ''}</button>
+    <div id="memoBox" class="memo${lsGet('kf_memo_open', 0) ? '' : ' hidden'}"><textarea id="memoTa" rows="4" placeholder="Memo — stays on this phone">${esc(lsGet('kf_memo', ''))}</textarea><div class="muted" id="memoHint">${lsGet('kf_memo', '') ? 'Saved on this phone' : 'Anything — it is saved as you type'}</div></div>
   </div>
   <div class="grid2 stagger" style="margin-top:12px">${tiles.map(([k, ic, l, n, sub, cls], i) => `<button class="tile ${cls} ${tones[k]}" data-list="${k}" style="--i:${i}"><span class="ic">${ic}</span><span class="n">${n}</span><span>${l}</span><span class="s">${esc(sub)}</span></button>`).join('')}</div>
-  ${sec('💰 Chase first', chase.slice(0, 5).map((x) => dunItem(x)).join(''), 'Nobody to chase today 🎉', 'collections')}
+  ${sec('💰 Chase first', chase.slice(0, 5).map((x) => dunItem(x)).join(''), 'Nobody to chase today 🏖️', 'collections')}
   ${m.watch.some((w) => w.lvl !== 'low') ? sec('⚠️ Look after this week', m.watch.filter((w) => w.lvl !== 'low').slice(0, 3).map((w) => watchItem(w, { max: 2 })).join(''), '', 'watch') : ''}
   ${sec('🔧 Visits due', m.visitsDue.slice(0, 5).map((x) => cItem(x, `<span class="pill ${x.due < t ? 'bad' : 'warn'}">${esc(x.filterOnly ? 'filter' : x.due === t ? 'today' : x.due)}</span>`)).join(''), 'No visits due', 'visits')}
   ${sec('📋 Open requests', m.openReq.slice(0, 4).map(reqItem).join(''), 'No open requests', 'requests')}
@@ -1789,11 +1929,16 @@ export function dunItem(x) {
   // v0.9 #1: tries since the money went late (or in the last 30 days) + the promise, if any
   const t0 = today(); const tries = (x.chases || []).filter((q) => q.date >= (x.led.overdueSince || R.addDays(t0, -30))); const last = tries[0];
   const pr = x.pr && ['waiting', 'broken'].includes(x.pr.status) ? x.pr : null;
-  const prLine = pr ? `<div class="s chase-${pr.status}">${pr.status === 'broken' ? '🤝❌' : '🤝'} <span>${esc(pr.status === 'broken' ? `promise broken (${pr.date})` : `promised by ${pr.date}`)}</span>${pr.amount ? ` · ${R.npr(pr.amount)}` : ''}</div>` : '';
-  const chLine = tries.length ? `<div class="s chase-tries">📞 <span>${esc(`${tries.length} ${tries.length === 1 ? 'try' : 'tries'}`)}</span> · <span>${esc('last: ' + (last.reached || last.channel || '—'))}</span> · <span>${esc(last.date === t0 ? 'today' : `${R.daysBetween(last.date, t0)} d ago`)}</span></div>` : '';
+  const prLine = pr ? `<div class="s chase-${pr.status}">${S.desk ? (pr.status === 'broken' ? '🤝❌ ' : '🤝 ') : ''}<span>${esc(pr.status === 'broken' ? `promise broken (${pr.date})` : `promised by ${pr.date}`)}</span>${pr.amount ? ` · ${R.npr(pr.amount)}` : ''}</div>` : '';
+  const chLine = tries.length ? `<div class="s chase-tries">${S.desk ? '📞 ' : ''}<span>${esc(`${tries.length} ${tries.length === 1 ? 'try' : 'tries'}`)}</span> · <span>${esc('last: ' + (last.reached || last.channel || '—'))}</span> · <span>${esc(last.date === t0 ? 'today' : `${R.daysBetween(last.date, t0)} d ago`)}</span></div>` : '';
+  // v0.11 phone (Tara 2026-09-30): one accent per card (the stage pill), plain text, the three actions on their own line so the text keeps its width
+  const rs = remSent(x.c.id); const sentPill = rs ? ` <span class="pill sent">💬 sent ${esc(new Date(rs.at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }))}</span>` : '';
+  if (!S.desk) return `<div class="item dun" data-cust="${esc(x.c.id)}"><div class="main"><div class="t">${esc(x.c.name)} <span class="pill ${cls}">${esc(d.short)}</span>${sentPill}</div>
+    <div class="s">${R.npr(d.owed)} · ${esc(when)} · ${esc(toleOf(x.c))}</div>${prLine}${chLine}
+    <div class="dun-acts"><a class="btn small ghost" href="tel:${esc(x.c.phone)}" data-stop>📞 Call</a><a class="btn small ghost" href="${esc(waLink(x.c.phone, dunText(x)))}" target="_blank" rel="noopener" data-stop data-rem-sent="${esc(x.c.id)}">💬 WhatsApp</a>${canForm('checkin') ? `<button class="btn small ghost" data-go-form="checkin" data-cid="${esc(x.c.id)}" data-kind="${esc(R.CHASE_KIND)}" title="Log a payment chase">📝 Log</button>` : ''}${S.settings.coQr ? `<button class="btn small ghost" data-act="rcBill" data-cid="${esc(x.c.id)}" data-stop title="Bill of the month with the payment QR">🧾 QR</button>` : ''}</div></div></div>`;
   return `<div class="item" data-cust="${esc(x.c.id)}"><span class="dot ${x.dot}"></span><div class="main"><div class="t">${esc(x.c.name)} <span class="pill ${cls}">${esc(d.short)}</span></div>
     <div class="s">${R.npr(d.owed)} · ${esc(when)} · ${esc(toleOf(x.c))}</div>${prLine}${chLine}</div>
-    <div class="acts">${canForm('checkin') ? `<button class="icon-btn" data-go-form="checkin" data-cid="${esc(x.c.id)}" data-kind="${esc(R.CHASE_KIND)}" title="Log a payment chase">📝</button>` : ''}<a class="icon-btn" href="${esc(waLink(x.c.phone, dunText(x)))}" target="_blank" rel="noopener" data-stop>💬</a><a class="icon-btn" href="tel:${esc(x.c.phone)}" data-stop>📞</a></div></div>`;
+    <div class="acts">${canForm('checkin') ? `<button class="icon-btn" data-go-form="checkin" data-cid="${esc(x.c.id)}" data-kind="${esc(R.CHASE_KIND)}" title="Log a payment chase">📝</button>` : ''}<a class="icon-btn" href="${esc(waLink(x.c.phone, dunText(x)))}" target="_blank" rel="noopener" data-stop data-rem-sent="${esc(x.c.id)}">💬</a><a class="icon-btn" href="tel:${esc(x.c.phone)}" data-stop>📞</a></div></div>`;
 }
 // Last-90-days chasing line (collections list + desk money page)
 export function chaseStatsLine(cs) {
@@ -1804,7 +1949,7 @@ export function chaseStatsLine(cs) {
 // v0.9 #4: the verdict of the latest screening for a lead (or a button to screen it)
 export function screenPill(l) {
   const sc = R.findScreening(arr('screenings'), l.id, l.phone);
-  return sc ? `<span class="pill ${{ Pass: 'ok', Check: 'warn', Hold: 'bad' }[sc.verdict] || 'grey'}">🔎 ${esc(sc.verdict)}</span>` : ['Signed', 'Rejected'].includes(l.outcome) ? '' : `<button class="btn small ghost" data-go-form="screening" data-lead="${esc(l.id)}">🔎 Screen</button>`;
+  return sc ? `<span class="pill ${{ Pass: 'ok', Check: 'warn', Hold: 'bad' }[sc.verdict] || 'grey'}">🔎 ${esc('Screening: ' + sc.verdict)}</span>` : ['Signed', 'Rejected'].includes(l.outcome) ? '' : `<button class="btn small ghost" data-go-form="screening" data-lead="${esc(l.id)}">🔎 Screen first</button>`;
 }
 export function contractItem(e, o) {
   const c = S.D.customers.get(e.customerId) || {}; const ic = { 'Notice to end': '🚪', 'Transfer to a new holder': '🔁', 'Lost or stolen': '🚨' }[e.kind] || '📜';
@@ -1812,12 +1957,12 @@ export function contractItem(e, o) {
   const dot = o ? (o.overdue || o.soon || o.kind === 'lost' ? 'r' : 'y') : 'g';
   return `<div class="item" data-edit="contract" data-id="${esc(e.id)}"><span class="dot ${dot}"></span><div class="main"><div class="t">${ic} ${esc(c.name || '?')} · <span>${esc(e.kind)}</span></div><div class="s">${esc(e.date || '')} · ${esc(s)}</div></div><button class="btn small ghost" data-cust="${esc(e.customerId)}">👤</button></div>`;
 }
-export const chaseFirst = (m) => m.collections.filter((x) => !(x.pr && x.pr.status === 'waiting'));
+export const chaseFirst = (m) => m.collections.filter((x) => !(x.pr && x.pr.status === 'waiting')).sort((a, b) => (remSent(a.c.id) ? 1 : 0) - (remSent(b.c.id) ? 1 : 0)); /* v0.11.1 (#3): reminded today → after the others (stable) */
 export function collectionGroups(xs) {
   const st = (x) => (x.pr ? x.pr.status : ''); const broken = xs.filter((x) => st(x) === 'broken'); const waiting = xs.filter((x) => st(x) === 'waiting').sort((a, b) => a.pr.date.localeCompare(b.pr.date));
   const rest = xs.filter((x) => !['broken', 'waiting'].includes(st(x)));
   const steps = R.DUNNING.map((d) => ({ key: d.stage, label: d.label, xs: rest.filter((x) => x.dn.stage === d.stage) })).filter((g) => g.xs.length).reverse();
-  return [...(broken.length ? [{ key: 'broken', label: '🤝❌ Promise broken — call or visit now', xs: broken }] : []), ...steps, ...(waiting.length ? [{ key: 'waiting', label: '🤝 Promised — wait until their day', xs: waiting }] : [])];
+  return [...(broken.length ? [{ key: 'broken', label: 'Promise broken — call or visit now', xs: broken }] : []), ...steps, ...(waiting.length ? [{ key: 'waiting', label: 'Promised — wait until their day', xs: waiting }] : [])];
 }
 // Filter order dates: when each filter runs out on the shelf and the last day to order (lead time + safety) — settings hold the guesses.
 // v0.9 #7 parts on the shelf and with people · tools
@@ -1825,9 +1970,9 @@ export function partsCard(m) {
   const st = m.metrics.stock; const min = Number(S.settings.partsMin) > 0 ? Number(S.settings.partsMin) : R.PARTS_MIN; const ppl = R.partsWithPeople(m.D.stockMoves, m.D.visits);
   const who = Object.keys(ppl).filter((w) => Object.values(ppl[w]).some((n) => n));
   const tools = m.D.tools.slice().sort((a, b) => String(a.name).localeCompare(String(b.name)));
-  return `<div class="card"><div class="status" style="font-size:15px">🔩 Parts</div><div class="muted" style="margin:4px 0 8px">Shelf = in − out − issued + returned − used from the shelf. Order more below ${min} (🔴 first guess · Settings). G-1 §5-3: issue in the morning, return in the evening — both signed.</div>
+  return `<div class="card"><div class="status" style="font-size:15px">🔩 Parts</div><div class="muted" style="margin:4px 0 8px">Shelf = in − out − issued + returned − used from the shelf. Order more below ${min} (🔴 first guess · Settings). Issue in the morning, return in the evening — both signed.</div>
     <div class="scroll-x"><table class="tbl"><tr><th>Part</th><th class="n">Shelf</th>${who.map((w) => `<th class="n">${esc(w)}</th>`).join('')}<th></th></tr>
-    ${partsList().map((p) => { const n = st['Part: ' + p] ?? 0; return `<tr><td>${esc(p)}</td><td class="n">${n}</td>${who.map((w) => { const h = ppl[w][p] || 0; return `<td class="n"${h < 0 ? ' style="color:var(--bad)"' : ''}>${h}</td>`; }).join('')}<td>${n < min ? '<span class="pill warn">order</span>' : ''}</td></tr>`; }).join('')}</table></div>${who.some((w) => Object.values(ppl[w]).some((h) => h < 0)) ? `<div class="hint" style="color:var(--bad)">${esc('A negative number = used from the bag with no issue record — record the morning issue (G-1 §5-3).')}</div>` : ''}</div>
+    ${partsList().map((p) => { const n = st['Part: ' + p] ?? 0; return `<tr><td>${esc(p)}</td><td class="n">${n}</td>${who.map((w) => { const h = ppl[w][p] || 0; return `<td class="n"${h < 0 ? ' style="color:var(--bad)"' : ''}>${h}</td>`; }).join('')}<td>${n < min ? '<span class="pill warn">order</span>' : ''}</td></tr>`; }).join('')}</table></div>${who.some((w) => Object.values(ppl[w]).some((h) => h < 0)) ? `<div class="hint" style="color:var(--bad)">${esc('A negative number = used from the bag with no issue record — record the morning issue.')}</div>` : ''}</div>
     <div class="card"><div class="status" style="font-size:15px">🧰 Tools</div>${tools.length ? `<div class="scroll-x"><table class="tbl"><tr><th>Tool</th><th>With</th><th>State</th><th>Last check</th><th class="n">Staff pays</th></tr>${tools.map((x) => `<tr data-edit="tool" data-id="${esc(x.id)}" style="cursor:pointer"><td>${esc(x.name)}${x.serial ? ' <span class="muted">' + esc(x.serial) + '</span>' : ''}</td><td>${esc(x.holder || '')}</td><td><span class="pill ${x.status === 'OK' ? 'ok' : x.status === 'Needs repair' ? 'warn' : 'bad'}">${esc(x.status || '')}</span></td><td class="mono">${esc(x.calibrated || '—')}</td><td class="n">${x.staffShare ? R.npr(x.staffShare) : '—'}</td></tr>`).join('')}</table></div>` : '<div class="empty">No tools recorded yet</div>'}</div>`;
 }
 export function filterOrderCard(m) {
@@ -1849,11 +1994,14 @@ export function watchItem(w, opts = {}) {
     <div class="wacts">${form && canForm(form) ? `<button class="btn small" data-go-form="${form}" data-cid="${esc(c.id)}"${form === 'checkin' ? ` data-kind="${esc(w.callKind || 'Follow-up call')}"` : ''}>${lab}</button>` : `<button class="btn small ghost" data-cust="${esc(c.id)}">${form ? '👤 Open' : lab}</button>`}<a class="btn small ghost" href="tel:${esc(c.phone)}" data-stop>📞</a><a class="btn small ghost" href="${esc(waLink(c.phone))}" target="_blank" rel="noopener" data-stop>💬</a><button class="btn small ghost" data-watchok="${esc(c.id)}|${w.score}" title="Checked — hide for 7 days unless it gets worse">✓ Checked</button></div></div></div>`;
 }
 // Message wording follows G-1 §1-3 (3 days before) with the actual amount of this bill.
-export function dunText(x) {
-  const d = x.dn; const n = (x.c.name || '').split(' ')[0];
-  if (d.stage === 'reminder') return `Namaste ${n}! This is KORA CARE. Your water purifier bill of NPR ${Math.round(d.owed).toLocaleString('en-IN')} is due on ${d.bill.due}. You can pay by Khalti / eSewa QR. Thank you 🙏`;
-  if (d.stage === 'due') return `Namaste ${n}! Friendly reminder from KORA CARE: today's bill of NPR ${Math.round(d.owed).toLocaleString('en-IN')} is due. Khalti / eSewa QR works. Thank you 🙏`;
-  return `Namaste ${n}, this is KORA CARE. We have not received NPR ${Math.round(d.owed).toLocaleString('en-IN')} (due ${x.led.overdueSince}). Please pay by Khalti / eSewa QR, or call us if something is wrong with the purifier. Thank you 🙏`;
+export function dunText(x) { /* v0.17.0 (9) E3: the company bank QR (Jun 10/3 — no personal wallets) · English + Nepali · dates like the cards (AD + BS) · 🔴 Nepali drafts — Tara to check */
+  const d = x.dn; const n = (x.c.name || '').split(' ')[0]; const amt = Math.round(d.owed).toLocaleString('en-IN');
+  const ref = x.c.code ? ` Please write ${x.c.code} in the payment remark.` : '', refNe = x.c.code ? ` भुक्तानीको रिमार्कमा ${x.c.code} लेख्नुहोस्।` : ''; /* v0.11.1 (#9): the bank CSV match looks for the KC code first */
+  const when = (iso) => (R.isDate(iso) ? `${RC.niceDate(iso)} · ${RC.bsText(iso)}` : String(iso || '')); const whenNe = (iso) => (R.isDate(iso) ? RC.bsText(iso) : String(iso || ''));
+  const qr = 'scan the KORA CARE QR on your bill picture with any bank app', qrNe = 'बिलको तस्बिरमा भएको KORA CARE को QR जुनसुकै बैंकको एपबाट स्क्यान गर्नुहोस्';
+  if (d.stage === 'reminder') return `Namaste ${n} ji 🙏 This is KORA CARE. Your water purifier bill of NPR ${amt} is due on ${when(d.bill.due)}. To pay, ${qr}.${ref} Thank you 🙏\n\nनमस्ते ${n} जी 🙏 KORA CARE बाट। तपाईंको पानी प्युरिफायरको NPR ${amt} को बिल ${whenNe(d.bill.due)} मा तिर्नुपर्छ। तिर्न ${qrNe}।${refNe} धन्यवाद 🙏`;
+  if (d.stage === 'due') return `Namaste ${n} ji 🙏 A friendly reminder from KORA CARE: today's bill of NPR ${amt} is due. To pay, ${qr}.${ref} Thank you 🙏\n\nनमस्ते ${n} जी 🙏 KORA CARE बाट सम्झना: आज NPR ${amt} को बिल तिर्ने दिन हो। तिर्न ${qrNe}।${refNe} धन्यवाद 🙏`;
+  return `Namaste ${n} ji, this is KORA CARE. We have not received NPR ${amt} (due ${when(x.led.overdueSince)}). Please ${qr}, or call us if something is wrong with the purifier.${ref} Thank you 🙏\n\nनमस्ते ${n} जी, KORA CARE बाट। हामीले NPR ${amt} (${whenNe(x.led.overdueSince)} मा तिर्नुपर्ने) अझै पाएका छैनौं। कृपया ${qrNe}, वा प्युरिफायरमा केही समस्या छ भने हामीलाई फोन गर्नुहोस्।${refNe} धन्यवाद 🙏`;
 }
 export function reqItem(o) {
   const late = Date.now() > o.sla.replyBy, visitLate = Date.now() > o.sla.visitBy, old = Date.now() - (o.r.receivedAtMs || 0) > 3 * 864e5;
@@ -1878,18 +2026,16 @@ function withApproval(col, id, data) {
 }
 
 
-export const canForm = (f) => (f === 'payPerson' ? isBoss() : !FORM_PERM[f] || can(FORM_PERM[f])); /* payroll: Jun and the deputy only */
+export const canForm = (f) => (f === 'payPerson' ? isBoss() : f === 'milestone' ? !!S.isAdmin : f === 'training' ? !!S.isAdmin : !FORM_PERM[f] || can(FORM_PERM[f])); /* payroll: Jun and the deputy only · training records: admin accounts only (Jun 2026-09-30 "내 화면에만") */
 function viewNew() {
-  const list = [
-    ['install', 'New install', 'customer + device + day-1 payment'], ['visit', 'Visit', 'filters · TDS · flow · repair'],
-    ['payment', 'Payment', 'monthly bill · repair'], ['request', 'Service request', 'breakdown · leak · claim'],
-    ['lead', 'Lead', 'interested household'], ['checkin', 'Check-in call', 'day 7/30/60/90 · happy call'],
-    ['relocation', 'Relocation', 'customer moves house'], ['recovery', 'Recovery case', 'customer left — get the device'],
-    ['expense', 'Expense', 'bill · receipt · VAT'], ['device', 'Device event', 'arrival · check · refurbish'],
-    ['photo', 'Add photos', 'house · device · contract'], ['training', 'Training', 'who learned what'], ['stock', 'Stock', 'devices & filters in/out'],
-    ['contract', 'Contract event', 'notice · transfer · lost'], ['screening', 'Sign-up screening', 'before an install'], ['claim', 'Supplier claim', 'defect → replace or credit'], ['tool', 'Tool', 'who has it · repairs'], ['waterTest', 'Raw-water vial', 'E. coli check (PoC)'],
-  ].filter(([f]) => canForm(f));
-  return `<h1>New</h1><div class="tiles-new stagger">${list.map(([f, l, sub], i) => `<button class="tile" data-go-form="${f}" style="--i:${i}"><span class="ic">${FORMS[f].icon}</span><span>${l}</span><span class="s">${sub}</span></button>`).join('')}</div>`;
+  // v0.11: grouped rows instead of 18 coloured tiles (Tara 2026-09-30) · the group colour is the icon box
+  const row = (f, l, s) => (canForm(f) ? [{ attr: `data-go-form="${f}"`, ic: FORMS[f].icon, l, s }] : []);
+  return `<h1>New</h1>` + rowsHtml([
+    { title: 'Every day', tone: 'tone-field', rows: [...row('visit', 'Visit', 'filters · TDS · flow · repair'), ...row('payment', 'Payment', 'monthly bill · repair'), ...row('install', 'New install', 'customer + device + day-1 payment'), ...row('request', 'Service request', 'breakdown · leak · claim'), ...row('checkin', 'Check-in call', 'day-7 call · follow-up · payment chase')] },
+    { title: 'Sales', tone: 'tone-lead', rows: [...row('lead', 'Lead', 'interested household'), ...row('screening', 'Sign-up screening', 'before an install')] },
+    { title: 'Sometimes', tone: 'tone-call', rows: [...row('relocation', 'Relocation', 'customer moves house'), ...row('recovery', 'Recovery case', 'customer left — get the device'), ...row('contract', 'Contract event', 'notice · transfer · lost'), ...row('photo', 'Add photos', 'house · device · contract'), ...row('waterTest', 'Raw-water vial', 'P/A check (PoC)')] },
+    { title: 'Office', tone: 'tone-bill', rows: [...row('expense', 'Expense', 'bill · receipt · VAT'), ...row('device', 'Device event', 'arrival · check · refurbish'), ...row('stock', 'Stock', 'devices & filters in/out'), ...row('claim', 'Supplier claim', 'defect → replace or credit'), ...row('tool', 'Tool', 'who has it · repairs'), ...row('training', 'Training', 'who learned what')] },
+  ]);
 }
 export function custListHtml(p) {
   const m = model(); const q = String(p.q || '').toLowerCase(); const f = p.f || 'all';
@@ -1899,7 +2045,7 @@ export function custListHtml(p) {
   if (f === 'paused') list = list.filter((x) => x.status === 'Paused');
   if (f === 'churned') list = list.filter((x) => x.status === 'Churned');
   if (f === 'all') list = list.filter((x) => x.status !== 'Churned');
-  if (q) list = list.filter((x) => [x.c.name, x.c.code, x.c.phone, toleOf(x.c), x.c.deviceSerial, x.c.tags].some((s) => String(s || '').toLowerCase().includes(q)));
+  if (q) list = list.filter((x) => [x.c.name, x.c.code, x.c.phone, toleOf(x.c), x.c.deviceSerial, x.c.notes].some((s) => String(s || '').toLowerCase().includes(q)));
   list.sort((a, b) => String(a.c.name).localeCompare(String(b.c.name)));
   const more = list.length > 200;
   return (list.slice(0, 200).map((x) => cItem(x)).join('') + (more ? `<div class="empty">+${list.length - 200} more — search to narrow</div>` : '')) || '<div class="empty">No customers</div>';
@@ -1928,6 +2074,8 @@ function viewDetail(p) {
   const refs = m.referrals.filter((r) => r.who.id === c.id && !r.done);
   const stPill = { Active: 'ok', Paused: 'blue', Churned: 'grey' }[x.status];
   const receipt = p.receipt && m.D.payments.find((q) => q.id === p.receipt);
+  const vrep = p.vrep && m.D.visits.find((q) => q.id === p.vrep); /* v0.14 (#7): no auto popup — a button; Tara decides whether the note goes out */
+  const inst = p.inst && c.id === p.inst;
   const bills = led.bills.slice(-6); const spans = R.pauseSpans(c, t); /* v0.9 #2 */
   const hasGps = c.gps && Number.isFinite(c.gps.lat) && Number.isFinite(c.gps.lng);
   const dest = hasGps ? `${c.gps.lat.toFixed(6)},${c.gps.lng.toFixed(6)}` : '';
@@ -1936,8 +2084,9 @@ function viewDetail(p) {
   if (x.dn && ['call', 'visit', 'late', 'due'].includes(x.dn.stage)) todo.push({ lvl: x.dn.stage === 'visit' || x.dn.stage === 'call' ? 'bad' : 'warn', ic: '💰', t: `Collect ${R.npr(led.overdue || x.dn.owed)}`, s: `${x.dn.label}${led.overdueSince ? ' · since ' + led.overdueSince : ''}`, a: `<a class="btn small ok" href="${esc(waLink(c.phone, dunText(x)))}" target="_blank" rel="noopener">💬 Remind</a>${canForm('checkin') ? `<button class="btn small ghost" data-go-form="checkin" data-cid="${esc(c.id)}" data-kind="${esc(R.CHASE_KIND)}">📝 Log chase</button>` : ''}<button class="btn small" data-go-form="payment" data-cid="${esc(c.id)}">💵 Pay</button>` });
   if (x.pr && x.pr.status === 'waiting') todo.push({ lvl: 'info', ic: '🤝', t: `promised by ${x.pr.date}`, s: `${x.pr.amount ? R.npr(x.pr.amount) + ' · ' : ''}${x.pr.by ? 'told ' + x.pr.by + ' · ' : ''}${x.pr.madeOn}` });
   else if (x.pr && x.pr.status === 'broken') todo.push({ lvl: 'bad', ic: '🤝', t: `promise broken (${x.pr.date})`, s: `${x.pr.amount ? R.npr(x.pr.amount) + ' promised · ' : ''}${R.npr(x.pr.paid)} paid by then` });
-  else if (x.dn && x.dn.stage === 'reminder') todo.push({ lvl: 'info', ic: '💰', t: `Bill ${R.npr(x.dn.owed)} due ${x.dn.bill.due}`, s: 'G-1 §1-3: send the reminder 3 days before', a: `<a class="btn small ghost" href="${esc(waLink(c.phone, dunText(x)))}" target="_blank" rel="noopener">💬 Remind</a>` });
-  const fo = x.fd.filter((f) => f.status === 'overdue');
+  else if (x.dn && x.dn.stage === 'reminder') todo.push({ lvl: 'info', ic: '💰', t: `Bill ${R.npr(x.dn.owed)} due ${x.dn.bill.due}`, s: 'Send the reminder 3 days before', a: `<a class="btn small ghost" href="${esc(waLink(c.phone, dunText(x)))}" target="_blank" rel="noopener">💬 Remind</a>` });
+  const fo = x.fb && x.fb.date <= t ? x.fd.filter((f) => x.fb.types.includes(f.type)) : x.fd.filter((f) => f.status === 'overdue'); /* v0.15: together = every filter in the batch */
+  if (x.c.installDate && x.c.installDate > t && c.phone) todo.push({ lvl: 'info', ic: '📅', t: `Installation booked ${x.c.installDate}`, s: R.daysBetween(t, x.c.installDate) <= 3 ? 'confirm with the customer' : 'confirm 3 days before', a: `<a class="btn small ghost" href="${esc(waLink(c.phone, confText(c, x.c.installDate)))}" target="_blank" rel="noopener">💬 Confirm date</a>` }); /* v0.14 (#4): a booked install gets a 3-day confirm */
   const ns = x.nv && x.nv.noShow; // 🚪 nobody home on the last try (v0.8 #7)
   if (ns && String(ns.date).slice(0, 10) === t) todo.push({ lvl: 'warn', ic: '🚪', t: 'Nobody home today', s: `${ns.noShowReason || 'Nobody home'} · trying again ${ns.retryDate}`, a: c.phone ? `<a class="btn small ghost" href="${esc(waLink(c.phone, missText(c, ns)))}" target="_blank" rel="noopener">💬 Sorry we missed you</a>` : '' });
   if (x.nv && x.nv.date <= t) todo.push({ lvl: x.nv.date < t ? 'bad' : 'warn', ic: '🔧', t: `Visit due ${x.nv.date === t ? 'today' : x.nv.date}`, s: x.nv.source, a: `${can('visit') ? omwBtn(c, 'btn small ghost') : ''}<button class="btn small" data-go-form="visit" data-cid="${esc(c.id)}">🔧 Visit</button>` });
@@ -1948,7 +2097,7 @@ function viewDetail(p) {
   for (const wt of m.vials.waiting.filter((q) => q.customerId === c.id)) todo.push({ lvl: 'info', ic: '🧫', t: 'Read the water vial', s: `filled ${wt.sampledDate || '?'}`, a: `<button class="btn small ghost" data-edit="waterTest" data-id="${esc(wt.id)}">🧫 Read</button>` });
   if (led.contractEnded) todo.push({ lvl: 'warn', ic: '📝', t: 'Contract ended — renew', s: `${R.PRICES.contractMonths} months since ${c.installDate}` });
   for (const o of m.contractOpen.filter((q) => q.e.customerId === c.id)) todo.push(o.kind === 'notice' ? { lvl: o.overdue || o.soon ? 'bad' : 'warn', ic: '📜', t: `ending on ${o.e.endDate || '?'} — book the recovery`, s: o.e.early ? `before 36 months · deposit paid ${R.npr(o.e.depositPaid || 0)} is kept (draft §2.2)` : 'after 36 months · deposit back with the unit (draft §2.2)', a: can('visit') ? `<button class="btn small" data-go-form="recovery" data-cid="${esc(c.id)}">📦 Start recovery</button>` : '' } : { lvl: 'warn', ic: '📜', t: 'device lost or stolen — not settled', s: `${o.e.fault || ''}${o.lateNotice ? ' · told us late (draft §2.5(b))' : ''}`, a: canForm('contract') ? `<button class="btn small ghost" data-edit="contract" data-id="${esc(o.e.id)}">Settle</button>` : '' });
-  for (const r of refs.filter((q) => q.ready)) todo.push({ lvl: 'info', ic: '🎁', t: r.role === 'referee' ? 'Referral: 1 month free (off bill 2)' : 'Referral reward: 1 month free', s: 'G-1 §4', a: isBoss() ? `<a href="#" class="btn small ghost" data-refcredit="${esc(r.who.id)}|${esc(r.forId)}">Apply</a>` : '' });
+  for (const r of refs.filter((q) => q.ready)) todo.push({ lvl: 'info', ic: '🎁', t: `Brought ${esc((S.D.customers.get(r.forId) || {}).name || 'a new home')} — referrer's 50% off a bill`, s: '3 months after their install · apply once', a: isBoss() ? `<a href="#" class="btn small ghost" data-refcredit="${esc(r.who.id)}|${esc(r.forId)}">Apply</a>` : '' });
   const worst = todo.some((q) => q.lvl === 'bad') ? 'bad' : todo.some((q) => q.lvl === 'warn') ? 'warn' : todo.length ? 'info' : 'ok';
   const nowCard = x.status === 'Churned' ? `<div class="card now lv-info"><div class="now-h">⚫ Customer has left${c.churnDate ? ` <span class="muted">${esc(c.churnDate)}</span>` : ''}</div>${recs.length ? '' : `<div class="now-i lv-warn"><span class="ic">📦</span><div class="main"><div class="t">No recovery case yet</div><div class="s">get the device back and settle the deposit</div></div><div class="acts"><button class="btn small" data-go-form="recovery" data-cid="${esc(c.id)}">📦 Start</button></div></div>`}</div>`
     : `<div class="card now lv-${worst}"><div class="now-h">${worst === 'ok' ? '✅ Nothing due here' : '⚡ Do now'}<span class="sp"></span>${worst === 'ok' ? `<span class="muted">${x.nv ? `next visit ${esc(x.nv.date)} · ` : ''}${led.nextBill ? 'next bill ' + esc(led.nextBill.due) : ''}</span>` : ''}</div>
@@ -1958,25 +2107,32 @@ function viewDetail(p) {
   <div class="det-h"><span class="dot ${x.dot}" style="width:16px;height:16px"></span><h1 style="margin:0">${esc(c.name)}</h1></div>
   <div class="muted">${esc(c.code)} · ${esc(toleOf(c))} · Ward ${esc(c.ward || '–')} · <span class="pill ${stPill}">${esc(x.status)}</span>${c._pending ? ' <span class="pill warn">on phone</span>' : ''}</div>
   ${assignLine(c, t)}
-  ${tagList(c).length ? `<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:8px">${tagList(c).map((g) => `<span class="pill blue">#${esc(g)}</span>`).join('')}</div>` : ''}
-  <div class="links">
+  <div class="links${S.desk ? '' : ' top3'}">
     <a href="tel:${esc(c.phone)}">📞 Call</a><a href="${esc(waLink(c.phone))}" target="_blank" rel="noopener">💬 WhatsApp</a>
+    ${can('pay') ? `<button data-go-form="payment" data-cid="${esc(c.id)}">💵 Pay</button>` : ''}${can('visit') ? `<button data-go-form="visit" data-cid="${esc(c.id)}">🔧 Visit</button>` : ''}
+  </div>
+  <div class="links more${S.desk ? '' : ' hidden'}" id="moreLinks">
     ${hasGps ? `<a href="${esc(G.dirUrl(dest))}" data-nav="${esc(dest)}" target="_blank" rel="noopener">🧭 Navigate</a>` : ''}
-    ${can('pay') ? `<button data-go-form="payment" data-cid="${esc(c.id)}">💵 Pay</button>` : ''}${can('visit') ? `<button data-go-form="visit" data-cid="${esc(c.id)}">🔧 Visit</button><button data-go-form="request" data-cid="${esc(c.id)}">📋 Request</button>` : ''}
+    ${can('visit') ? `<button data-go-form="request" data-cid="${esc(c.id)}">📋 Request</button>` : ''}
     ${can('visit') && x.status !== 'Churned' ? omwBtn(c) : ''}
     ${canEdit ? `<button data-go-form="customerEdit" data-id="${esc(c.id)}">✏️ Edit</button>` : ''}${canForm('contract') ? `<button data-go-form="contract" data-cid="${esc(c.id)}">📜 Contract</button>` : ''}
+    ${x.status === 'Active' && referralOn() ? `<button data-act="rcRef" data-cid="${esc(c.id)}">🎁 Referral card</button>` : ''}${(() => { const lv = [...m.D.visits.values()].filter((q) => q.customerId === c.id && String(q.status).includes('Completed')).sort((p, q) => String(q.date).localeCompare(String(p.date)))[0]; return lv ? `<button data-act="rcVisit" data-vid="${esc(lv.id)}">📨 Visit note</button>` : ''; })()}${x.status === 'Active' ? `<button data-act="rcInst" data-cid="${esc(c.id)}">🏠 Installed card</button>` : ''}${x.status === 'Active' && S.settings.coQr && (x.dn || (x.led && x.led.nextBill)) ? `<button data-act="rcBill" data-cid="${esc(c.id)}">🧾 Bill + QR</button>` : ''}
   </div>
+  ${S.desk ? '' : '<button class="btn ghost small" data-act="moreLinks" style="margin-top:6px">⋯ More</button>'}
   ${can('visit') && x.status !== 'Churned' ? omwChips(c) : ''}
   ${receipt ? receiptCard(x, receipt) : ''}
+  ${vrep ? `<div class="card" style="border-color:var(--ok)"><div class="status">🔧 Visit saved · ${esc(vrep.date)}</div><button type="button" class="btn ok" style="display:block;width:100%;margin-top:10px" data-act="rcVisit" data-vid="${esc(vrep.id)}">📨 Visit note → WhatsApp</button></div>` : ''}
+  ${inst ? `<div class="card" style="border-color:var(--ok)"><div class="status">🎉 Installed</div><button type="button" class="btn ok" style="display:block;width:100%;margin-top:10px" data-act="rcInst" data-cid="${esc(c.id)}">🏠 Installed card → WhatsApp</button><div class="muted" style="margin-top:6px;font-size:12px">Then the receipt below.</div></div>` : ''}
+  <div id="rcBox" class="hidden"></div>
   ${nowCard}
   <div class="sec">Location</div>
   <div class="card where">
     ${hasGps ? `<div class="minimap" id="miniMap" data-id="${esc(c.id)}" data-lat="${c.gps.lat}" data-lng="${c.gps.lng}" data-label="${esc((c.name || '').split(' ')[0])}"></div><div class="mini-foot"><span class="muted" data-mini-dist>📍 Tap the pin button on the map to see how far you are</span><a class="btn small" href="${esc(G.dirUrl(dest))}" data-nav="${esc(dest)}" target="_blank" rel="noopener">🧭 Navigate from here</a></div>`
-      : `<div class="empty">📍 No location saved for this house yet${canEdit ? ' — tap ✏️ Edit → “Get location now” at the door' : ''}.</div>`}
+      : `<div class="empty">📍 No location saved for this house yet.${can('visit') && x.status !== 'Churned' ? `<div style="margin-top:8px"><button class="btn small" data-act="gpsHere" data-cid="${esc(c.id)}">📍 Save my location as this house</button></div>` : ''}</div>`}
     ${kv([['Find the house', c.houseDetail], ['Tole · ward · zone', `${toleOf(c)} · Ward ${c.ward || '–'} · ${c.zone || '–'}`], ['Phone', `<a href="tel:${esc(c.phone)}">${esc(c.phone || '–')}</a>`, 1]])}
   </div>
   <div class="sec">Customer</div>
-  <div class="card">${kv([['Household', c.householdSize], ['Water before', c.prevWater], ['Water source', c.waterSource], ['Plan', c.plan], ['Signed up', c.signUpDate], ['Screening', (() => { const sc = R.findScreening(m.D.screenings, c.leadId, c.phone); return sc ? `${sc.verdict} · ${sc.decision || ''} · ${sc.date || ''}` : undefined; })()], ['Heard via', (c.referral || '') + (c.referrerName ? ' — ' + c.referrerName : '') + (c.referrerId && S.D.customers.get(c.referrerId) ? ' — ' + S.D.customers.get(c.referrerId).name : '')], ...(c.buyerPan ? [['Buyer PAN', c.buyerPan]] : []), ['Notes', c.notes]])}</div>
+  <div class="card">${kv([['Household', c.householdSize], ['Water before', c.prevWater], ['Water source', c.waterSource], ['Plan', c.plan], ['Signed up', c.signUpDate], ['Screening', (() => { const sc = R.findScreening(m.D.screenings, c.leadId, c.phone); return sc ? `${sc.verdict} · ${sc.decision || ''} · ${sc.date || ''}` : undefined; })()], ['Heard via', (c.referral || '') + (c.referrerName ? ' — ' + c.referrerName : '') + (c.referrerId && S.D.customers.get(c.referrerId) ? ' — ' + S.D.customers.get(c.referrerId).name : '')], ...(c.buyerPan ? [['Buyer PAN', c.buyerPan]] : []), ['Special comment', c.notes]])}</div>
   ${isBoss() ? `<div class="card"><label for="privNotes">🔒 Private notes</label><textarea id="privNotes" placeholder="loading…"></textarea><button class="btn ghost" data-act="privSave" data-cid="${esc(c.id)}">Save private notes</button></div>` : ''}
   ${isBoss() ? (() => { const atOf = (a) => (a.createdAt && a.createdAt.toMillis ? new Date(a.createdAt.toMillis()).toISOString() : String(a.at || '')); const ch = arr('audit').filter((a) => a.customerId === c.id).map((a) => ({ ...a, at: atOf(a), by: userName(a.createdBy, a.createdBy ? '' : a.by) })).sort((a, b) => b.at.localeCompare(a.at)).slice(0, 15); return ch.length ? `<div class="sec">🕵️ Changes to this home</div><div class="card">${ch.map((a) => `<div class="muted" style="margin:4px 0" data-noi18n><b>${esc(String(a.at || '').slice(0, 16).replace('T', ' '))}</b> · ${esc(a.by || '—')} · ${esc(a.col)} — ${(a.fields || []).map((f) => `${esc(f)}: ${esc((a.before || {})[f] || '—')} → ${esc((a.after || {})[f] || '—')}`).join(' · ')}</div>`).join('')}</div>` : ''; })() : ''}
   <div class="sec">Device & filters</div>
@@ -1999,9 +2155,9 @@ function viewDetail(p) {
     ${(led.skipped || []).length ? `<div class="muted" style="margin-top:6px">${esc('⏸️ Skipped bill days (paused): ' + led.skipped.join(' · '))}</div>` : ''}
     ${spans.length ? `<div class="sec-mini">⏸️ Pauses (${spans.length})</div>${spans.slice().reverse().map((p) => `<div class="muted" style="margin:3px 0">${esc(p.from || '?')} → <span>${esc(p.to || (p.until ? 'until ' + p.until : 'still paused'))}</span>${p.days !== null ? ` · <span>${esc(p.days + ' days')}</span>` : ''}${esc(p.reason ? ' · ' + p.reason : '')}${p.endedAs === 'Churned' ? ' · <span class="pill grey">left</span>' : ''}${p.late ? ' · <span class="pill bad">restart day passed</span>' : ''}${p.by ? ' · ' + esc(p.by) : ''}</div>`).join('')}` : ''}
     ${x.chases && x.chases.length ? `<div class="sec-mini">📞 Payment contacts (${x.chases.length})</div>${x.chases.slice(0, 8).map((q) => { const pq = R.isDate(q.promiseDate) ? R.promiseOf([q], pays, t) : null; return `<div class="muted" style="margin:3px 0">${esc(q.date)} · ${esc(q.channel || '')} · <span>${esc(q.reached || '—')}</span>${q.by ? ' · ' + esc(q.by) : ''}${pq ? ` · 🤝 <span>${esc(`promised by ${pq.date}`)}</span>${pq.amount ? ' ' + R.npr(pq.amount) : ''} <span class="pill ${{ kept: 'ok', late: 'warn', broken: 'bad', waiting: 'blue' }[pq.status]}">${esc({ kept: 'kept', late: 'paid late', broken: 'broken', waiting: 'waiting' }[pq.status])}</span>` : ''}${q.lateReason ? ' · ' + esc(q.lateReason) : ''}${q.notes ? ` · “${esc(q.notes)}”` : ''}</div>`; }).join('')}` : ''}
-    ${refs.length ? `<div class="note">🎁 Referral reward: ${refs.map((r) => `${r.role === 'referee' ? '1 month free (off bill 2)' : '1 month free (referrer)'} ${r.ready ? `— <a href="#" data-refcredit="${esc(r.who.id)}|${esc(r.forId)}">apply</a>` : `(${esc(r.waiting)})`}`).join(' · ')}</div>` : ''}
+    ${refs.length ? `<div class="note">🎁 Referral reward: ${refs.map((r) => `${'50% off a bill (referrer)'} ${r.ready ? `— <a href="#" data-refcredit="${esc(r.who.id)}|${esc(r.forId)}">apply</a>` : `(${esc(r.waiting)})`}`).join(' · ')}</div>` : ''}
   </div>
-  <div class="sec">Photos</div><div class="card"><div class="thumbs" id="photoBox"><span class="muted">Loading…</span></div><button class="btn ghost small" data-go-form="photo" data-cid="${esc(c.id)}">📷 Add photos</button></div>
+  <details class="card tl" style="padding:10px 14px"><summary class="sec" style="margin:0;cursor:pointer">🗂️ Photo timeline <span class="muted">(ours · not sent)</span></summary><div class="thumbs" id="photoBox"><span class="muted">Loading…</span></div></details><div class="card"><div class="row"><button class="btn ghost small" data-go-form="photo" data-cid="${esc(c.id)}">📷 Add photos</button>${DEMO ? '' : `<button class="btn ghost small" data-act="photosNet" data-cid="${esc(c.id)}">☁️ Load from server</button>`}</div></div>
   ${rels.length ? `<div class="sec">Relocations (${rels.length})</div><div class="card flush">${rels.map((r) => `<div class="item" data-edit="relocation" data-id="${esc(r.id)}"><div class="main"><div class="t">${esc(r.moveDate || '')} · ${esc(r.status)}</div><div class="s">${esc(r.oldTole === 'Other' ? r.oldToleOther : r.oldTole || '?')} → ${esc(r.newTole === 'Other' ? r.newToleOther : r.newTole || '?')}${r.newSerial ? ' · new device ' + esc(r.newSerial) : ''}</div></div><div class="r">›</div></div>`).join('')}</div>` : ''}
   <div class="sec">Visits (${x.vs.length})</div>
   <div class="card">${x.vs.length ? `<div class="timeline">${x.vs.slice().reverse().map((v) => `<div class="ev"><b>${esc(v.date)}</b> · ${esc(v.visitType || 'Visit')} <span class="pill ${isDone(v.status) ? 'ok' : 'grey'}">${esc(String(v.status || '').replace(/^\S+\s/, ''))}</span>${v.signed ? ' ✍️' : ''}${v._pending ? ' <span class="pill warn">on phone</span>' : ''}<div class="muted">${esc((v.filters || []).join(', ') || 'no filter')} · PP ${esc(v.ppColor || '–')} · TDS ${esc(v.tdsBefore ?? '–')}→${esc(v.tdsAfter ?? '–')} · flow ${esc(v.flow ?? '–')} · ${esc(v.technician || '')}</div>${v.notes ? `<div class="muted">“${esc(v.notes)}”</div>` : ''}</div>`).join('')}</div>` : '<div class="empty">No visits yet</div>'}</div>
@@ -2010,8 +2166,8 @@ function viewDetail(p) {
   ${reqs.length ? `<div class="sec">Requests</div><div class="card flush">${reqs.map((r) => `<div class="item" data-edit="request" data-id="${esc(r.id)}"><div class="main"><div class="t">${esc(r.type)} · ${esc(r.status)}</div><div class="s">${esc(String(r.receivedAt || '').replace('T', ' '))} · ${esc(String(r.description || '').slice(0, 70))}</div></div><div class="r">›</div></div>`).join('')}</div>` : ''}
   <div class="sec">Onboarding & calls</div>
   <div class="card"><div class="progress-steps" style="margin-bottom:10px">${x.ob.slice(0, 4).map((o) => `<i class="${o.status === 'done' ? 'on' : ''}" title="${esc(o.label)}"></i>`).join('')}</div>
-    ${x.ob.map((o) => `<div class="item" data-go-form="checkin" data-cid="${esc(c.id)}" data-kind="${esc(o.k === 'Q' ? 'Quarterly call' : o.k)}"><div class="main"><div class="t">${esc(o.label)}</div><div class="s">${esc(o.due)}${o.done ? ' · ' + esc(o.done.result) + ' by ' + esc(o.done.by) : ''}</div></div><div class="r"><span class="pill ${o.status === 'done' ? 'ok' : o.status === 'overdue' ? 'bad' : o.status === 'due' ? 'warn' : 'grey'}">${o.status}</span></div></div>`).join('')}
-    ${chks.filter((q) => !['D7', 'D30', 'D60', 'D90', R.CHASE_KIND].includes(q.kind)).map((q) => `<div class="muted">📞 ${esc(q.date)} ${esc(q.kind)} · ${esc(q.result)}${q.satisfaction ? ' · ' + '★'.repeat(Math.max(0, Math.min(5, Math.round(Number(q.satisfaction) || 0)))) : ''}</div>`).join('')}</div>
+    ${x.ob.map((o) => `<div class="item" data-go-form="checkin" data-cid="${esc(c.id)}" data-kind="${esc(o.k)}"><div class="main"><div class="t">${esc(o.label)}</div><div class="s">${esc(o.due)}${o.done ? ' · ' + esc(o.done.result) + ' by ' + esc(o.done.by) : ''}</div></div><div class="r"><span class="pill ${o.status === 'done' ? 'ok' : o.status === 'overdue' ? 'bad' : o.status === 'due' ? 'warn' : 'grey'}">${o.status}</span></div></div>`).join('')}
+    ${chks.filter((q) => !['D7', R.CHASE_KIND].includes(q.kind)).map((q) => `<div class="muted">📞 ${esc(q.date)} ${esc(q.kind)} · ${esc(q.result)}${q.satisfaction ? ' · ' + '★'.repeat(Math.max(0, Math.min(5, Math.round(Number(q.satisfaction) || 0)))) : ''}</div>`).join('')}</div>
   ${(() => { const ce = arr('contractEvents').filter((e) => e.customerId === c.id).sort((a, b) => String(b.date).localeCompare(String(a.date))); return ce.length ? `<div class="sec">📜 Contract events (${ce.length})</div><div class="card flush">${ce.map(contractItem).join('')}</div>` : ''; })()}
   ${recs.length ? `<div class="sec">Recovery</div><div class="card flush">${recs.map((r) => `<div class="item" data-edit="recovery" data-id="${esc(r.id)}"><div class="main"><div class="t">${esc(r.outcome)}</div><div class="s">started ${esc(r.startedDate)} · attempts ${esc(r.attempts ?? '–')}${r.daysToClose !== null && r.daysToClose !== undefined ? ' · ' + r.daysToClose + ' days' : ''}</div></div><div class="r">›</div></div>`).join('')}</div>` : ''}
   ${custTimeline(c, m)}
@@ -2052,12 +2208,122 @@ function tdsChart(vs, c) {
     <text class="ax" x="8" y="${h - 2}">${esc(pts[0][0])}</text><text class="ax" x="${w - 8}" y="${h - 2}" text-anchor="end">${esc(pts[pts.length - 1][0])}</text><text class="ax" x="${w - 8}" y="10" text-anchor="end">max ${Math.max(...ys)}</text></svg></div>`;
 }
 // Receipt: deposit and subscription on separate lines (G-1 §1-2 · lawyer R3 D2(c)).
-function receiptCard(x, pay) {
-  const sp = x.led.splits[pay.id] || {};
-  const lines = sp.extra !== undefined ? [[pay.type, sp.extra]] : [['Installation / first month', sp.install], ['Subscription', sp.subscription], ['Refundable deposit (not a fee)', sp.deposit], ['Credit carried forward', sp.unallocated]].filter(([, v]) => v > 0.01);
-  const text = `KORA CARE — receipt\n${x.c.name} (${x.c.code})\nDate: ${pay.date}\n` + lines.map(([l, v]) => `${l}: NPR ${Math.round(v).toLocaleString('en-IN')}`).join('\n') + `\nTotal: NPR ${Math.round(pay.amount).toLocaleString('en-IN')}${Number(pay.discount) > 0 ? `\nDiscount: NPR ${Math.round(pay.discount).toLocaleString('en-IN')}${pay.approval === 'Pending' ? ' (waiting for approval)' : pay.approval === 'Rejected' ? ' (not approved)' : ''}` : ''}\nPaid by: ${pay.method || ''}${pay.ref ? ' · ' + pay.ref : ''}\nThank you! 🙏`;
-  return `<div class="card" style="border-color:var(--ok)"><div class="status">🧾 Receipt</div><pre class="diag" style="color:var(--ink);margin:10px 0 0">${esc(text)}</pre>
-    <a class="btn ok" style="display:block;text-align:center;text-decoration:none;line-height:56px" href="${esc(waLink(x.c.phone, text))}" target="_blank" rel="noopener">💬 Send receipt on WhatsApp</a></div>`;
+function receiptCard(x, pay) { /* v0.14 (Jun 10/3 #6): the picture is the receipt — the text version is gone */
+  return `<div class="card" style="border-color:var(--ok)"><div class="status">🧾 Receipt saved · ${esc(RC.receiptNo(pay))}</div>
+    <button type="button" class="btn ok" style="display:block;width:100%;margin-top:10px" data-act="rcImg" data-pid="${esc(pay.id)}">🧾 Receipt → WhatsApp</button></div>`;
+}
+/* v0.12 image receipt (Jun 2026-10-01 "이거로 하자"): the picture version of the same payment, drawn on this phone (receipt.js),
+   then the share sheet → WhatsApp → the customer. Falls back to "save the image" where the share sheet cannot take files. */
+/* v0.12 image receipt (Jun 2026-10-01 "이거로 하자") + v0.13 referral card · visit report (Jun 10/2 "뭐 할거 더 없어?") — all drawn on this phone
+   (receipt.js) then the share sheet → WhatsApp → the customer. Falls back to "save the image" where the share sheet cannot take files. */
+async function visitPhotos(parent) { /* v0.14: the first two photos saved with a record (phone copies first, then the cache) → Image objects for the canvas */
+  const out = []; const toImg = (src) => new Promise((res) => { const im = new Image(); im.onload = () => res(im); im.onerror = () => res(null); im.src = src; });
+  for (const e of myJournal().filter((e) => e.photo && e.data && e.data.parent === parent)) { const img = await photoGet(e.id); if (img && out.length < 2) out.push(img); }
+  if (out.length < 2 && !DEMO) { try { const q = query(collection(db, 'photos'), where('parent', '==', parent), qLimit(4)); (await getDocsFromCache(q)).forEach((d) => { const x = d.data(); if (typeof x.img === 'string' && x.img.startsWith('data:image/') && out.length < 2) out.push(x.img); }); } catch (e) {} }
+  const ims = []; for (const src of out) { const im = await toImg(src); if (im) ims.push(im); }
+  return { before: ims[0] || null, after: ims[1] || null };
+}
+// v0.15: who is on the card — full name + photo from the Staff page (users.fullName / users.photo); own profile on a staff phone; the name alone otherwise
+export async function staffWho(name) {
+  const n = String(name || '').trim(); if (!n) return {};
+  if (isBoss() && !S.usersCache && !DEMO) { try { S.usersCache = await fetchUsers(); } catch (e) {} } /* Jun / the deputy can read every staff card */
+  const us = [...(S.usersCache || []), ...(S.demoUsers || [])]; let u = us.find((q) => q.name === n || q.fullName === n);
+  if (!u && S.profile && (S.profile.name === n || S.profile.fullName === n || myName() === n)) u = S.profile;
+  const out = { name: (u && u.fullName) || n };
+  if (u && u.photo) out.photo = await new Promise((res) => { const im = new Image(); im.onload = () => res(im); im.onerror = () => res(null); im.src = u.photo; });
+  return out;
+}
+// v0.16: the company payment QR lives in Settings (uploaded picture, never in the code)
+function qrImage() { const src = S.settings.coQr; if (!src) return Promise.resolve(null); return new Promise((res) => { const im = new Image(); im.onload = () => res(im); im.onerror = () => res(null); im.src = src; }); }
+// v0.16 #4 (optimisation, Jun 10/3 "최적화를 하자"): a customer picture is drawn once and kept. Right after a payment, visit or
+// install is saved, its card is drawn in the background, so the WhatsApp button shows it at once. The key is the card's content
+// (photos counted by size), so a change — a payment, a setting, a new photo — draws it again instead of showing an old picture.
+const RC_CACHE = new Map(); const RC_MAX = 4; /* the PNG is kept, not the canvas — a 1440 × 2800 canvas is ~16 MB of phone memory */
+const imgKey = (k, v) => (v && typeof v === 'object' && typeof v.src === 'string' && 'naturalWidth' in v ? 'img:' + v.src.length : v);
+export const rcCacheKeys = () => [...RC_CACHE.keys()];
+// ---- v0.16.0 (5) · Jun 10/3 "일단 내가 하는거로. 맥으로": the customer cards go out from the desk for now (WhatsApp Web = the company account in Chrome).
+// Which cards are sent is kept on THIS computer only (localStorage) — no server field, no rules change · 60 days, then forgotten.
+const CARDS_SENT = 'kf_cards_sent';
+export function cardsSent() { try { const v = JSON.parse(localStorage.getItem(CARDS_SENT) || '{}'); return v && typeof v === 'object' && !Array.isArray(v) ? v : {}; } catch (e) { return {}; } }
+export function markCardSent(key, on) {
+  const s = cardsSent(); if (on) s[key] = today(); else delete s[key];
+  const cut = R.addDays(today(), -60); for (const k of Object.keys(s)) if (!R.isDate(s[k]) || s[k] < cut) delete s[k];
+  try { localStorage.setItem(CARDS_SENT, JSON.stringify(s)); } catch (e) {}
+  return !!s[key];
+}
+// practice/demo: the numbers are made up ('+97798' + 8 random digits) and may belong to real people — never open their chat
+export const waWebUrl = (phone, demo = DEMO) => { const d = String(phone || '').replace(/\D/g, ''); return demo || !d ? 'https://web.whatsapp.com/' : 'https://web.whatsapp.com/send?phone=' + d; };
+export function waWebOpen(phone) { /* one named tab: the next card reuses it instead of opening WhatsApp Web again */
+  try { return window.open(waWebUrl(phone), 'kora-wa'); } catch (e) { return null; }
+}
+function csLayout() { /* v0.16.0 (7): 8 rows on screen, the rest behind "+N more" · counts follow the rows */
+  const L = document.querySelector('.cs-list'); if (!L) return;
+  const rows = [...L.querySelectorAll('.cs-i')]; const open = L.classList.contains('cs-open');
+  rows.forEach((r, i) => r.classList.toggle('hidden', !open && i >= 8));
+  const mb = document.querySelector('[data-act="cardsMore"]'); if (mb) { if (!open && rows.length > 8) mb.textContent = `+${rows.length - 8} more`; else mb.remove(); }
+  const n = document.querySelector('[data-cards-todo]'); if (n) { n.textContent = `${rows.length} to send`; n.classList.toggle('warn', rows.length > 0); n.classList.toggle('ok', !rows.length); }
+  if (!rows.length && !L.querySelector('.empty')) L.insertAdjacentHTML('beforeend', '<div class="empty">Nothing to send</div>');
+}
+const sentLabel = (on) => (on ? '✓ Sent · ↩ undo' : '✓ Sent — take it off the list'); /* v0.17.0 (1) (2): Jun "mark as sent가 뭐야" — say what the button does */
+function syncSentUi(key, on) { /* in place — re-rendering the modal would drop the picture */
+  for (const b of document.querySelectorAll('#rcBox [data-act="cardSent"]')) if (b.dataset.key === key) { b.textContent = sentLabel(on); b.classList.toggle('on', !!on); }
+  if (on) {
+    let gone = 0; for (const r of document.querySelectorAll('[data-cardrow]')) if (r.dataset.cardrow === key) { r.remove(); gone++; }
+    const sp = document.querySelector('[data-cards-sent]'); if (gone && sp) { const k = (Number(sp.dataset.cardsSent) || 0) + 1; sp.dataset.cardsSent = String(k); sp.textContent = `${k} sent`; }
+    csLayout();
+  } else S.staleDesk = true; /* un-marked in the card window: the row comes back when the window closes and the desk redraws */
+}
+async function cardSpec(kind, id) {
+  const co = { name: S.settings.coName || 'Kora Care Private Limited', nameNe: S.settings.coNameNe || '', pan: S.settings.coPan || '', ward: S.settings.coAddress || 'Pokhara-13', phone: S.settings.coPhone || '', bankLine: S.settings.coBankLine || '' };
+  let x, d, draw, name, alt, noteWait = false;
+  if (kind === 'receipt') { const pay = S.D.payments.get(id); if (!pay) return null; x = model().cust.get(pay.customerId); if (!x) return { err: 'Customer not found' }; d = RC.receiptData(x, pay, co, [...S.D.payments.values()].filter((q) => q.customerId === pay.customerId), today()); draw = () => RC.drawReceipt(d); name = `${d.no}.png`; alt = 'receipt'; }
+  else if (kind === 'referral') { x = model().cust.get(id); if (!x) return null; d = RC.referralData(x, co); draw = () => RC.drawReferralCard(d); name = `KORA-referral-${d.code || 'card'}.png`; alt = 'referral card'; }
+  else if (kind === 'visit') { const v = S.D.visits.get(id); if (!v) return null; x = model().cust.get(v.customerId); if (!x) return null; const ph = (v.filters || []).includes('PP') ? await visitPhotos(`visits/${id}`) : {}; d = RC.visitData(x, v, co, ph, await staffWho(v.technician)); draw = () => RC.drawVisitReport(d); name = `KORA-visit-${v.date}-${d.code || ''}.png`; alt = 'visit note'; noteWait = !!(d.note && d.note.waiting); }
+  else if (kind === 'bill') { x = model().cust.get(id); if (!x) return null; d = RC.billData(x, co, await qrImage(), today()); if (!d) return { err: 'No bill to show for this home' }; draw = () => RC.drawBillCard(d); name = `KORA-bill-${d.code || ''}-${today()}.png`; alt = 'bill with QR'; } /* v0.16 #7 */
+  else if (kind === 'install') { x = model().cust.get(id); if (!x) return null; const ph = await visitPhotos(`customers/${id}`); d = RC.installData(x, co, ph.before || ph.after || null, await staffWho(x.c.agent || myName())); draw = () => RC.drawInstallCard(d); name = `KORA-installed-${d.code || ''}.png`; alt = 'installed card'; }
+  else return null;
+  return { kind, d, draw, name, alt, key: kind + '|' + id + '|' + JSON.stringify(d, imgKey), phone: (x && x.c && x.c.phone) || '', sentKey: ['receipt', 'visit', 'install'].includes(kind) ? kind + ':' + id : '', noteWait }; /* v0.16.0 (5): phone + sent key for the desk */
+}
+async function cardImage(sp) {
+  const hit = RC_CACHE.get(sp.key); if (hit) { RC_CACHE.delete(sp.key); RC_CACHE.set(sp.key, hit); return { ...hit, cached: true }; }
+  const cv = await sp.draw(); const blob = await RC.canvasBlob(cv); const e = { w: cv.width, h: cv.height, blob, url: URL.createObjectURL(blob), name: sp.name, alt: sp.alt };
+  cv.width = cv.height = 0; /* free the canvas memory at once (iOS keeps it otherwise) */
+  RC_CACHE.set(sp.key, e);
+  while (RC_CACHE.size > RC_MAX) { const [k0, e0] = RC_CACHE.entries().next().value; RC_CACHE.delete(k0); if (e0.url !== S.rcUrl) { try { URL.revokeObjectURL(e0.url); } catch (err) {} } }
+  return { ...e, cached: false };
+}
+// draw in the background after a save — idle time, never in the way of the screen that just opened
+function prerenderCard(kind, id, delay = 700) {
+  const go1 = async () => { try { const sp = await cardSpec(kind, id); if (sp && !sp.err) await cardImage(sp); } catch (e) {} };
+  setTimeout(() => (window.requestIdleCallback ? window.requestIdleCallback(go1, { timeout: 2500 }) : go1()), delay);
+}
+async function imageCard(kind, id) {
+  const box = $('#rcBox'); if (!box) return;
+  box.classList.remove('hidden'); const slow = setTimeout(() => { box.innerHTML = '<div class="muted" style="margin-top:8px">Making the picture…</div>'; }, 120);
+  try {
+    const sp = await cardSpec(kind, id); if (!sp || sp.err) { clearTimeout(slow); if (sp && sp.err) toast(sp.err); box.classList.add('hidden'); return; }
+    const r = await cardImage(sp); clearTimeout(slow);
+    S.rcCanvas = { width: r.w, height: r.h }; S.rcKind = kind; /* the size only — the picture itself is the PNG */ S.rcBlob = r.blob; S.rcUrl = r.url; S.rcName = r.name; S.rcFromCache = r.cached; S.rcPhone = sp.phone || ''; S.rcSentKey = sp.sentKey || '';
+    const can = !!(navigator.share && navigator.canShare && navigator.canShare({ files: [new File([r.blob], S.rcName, { type: 'image/png' })] }));
+    const web = !!S.desk && /^\d{8,15}$/.test(String(S.rcPhone || '').replace(/\D/g, '')); /* v0.16.0 (5) ④ the desk sends through WhatsApp Web (the company account in Chrome) */
+    const sk = S.desk ? S.rcSentKey : ''; /* ⑥ sent mark — desk only */
+    const hint = web ? 'Saves the picture and opens the customer chat in WhatsApp Web → drag the picture in' : can && !S.desk ? 'Share → choose WA Business → the customer' : 'Save, then send it from WhatsApp';
+    if (S.desk) { /* v0.17.0 (1) A2: picture left · buttons right — stacked under the picture they sat below a 990-px screen (y 1103 · 1225) */
+      box.innerHTML = `<div class="rc-desk"><img class="rc-img" src="${esc(S.rcUrl)}" alt="${esc(r.alt)}"><div class="rc-side">
+        ${web ? '<button type="button" class="btn ok" data-act="rcWaWeb">💬 WhatsApp Web</button>' : ''}
+        <a class="btn ghost rc-save" href="${esc(S.rcUrl)}" download="${esc(S.rcName)}">⬇️ Save image</a>
+        ${sk ? `<button type="button" class="btn ghost rc-sent${cardsSent()[sk] ? ' on' : ''}" data-act="cardSent" data-key="${esc(sk)}">${sentLabel(!!cardsSent()[sk])}</button>` : ''}
+        <div class="muted rc-hint">${hint}</div>${sk ? '<div class="muted rc-hint">✓ = it leaves 📨 Cards to send (this computer only)</div>' : ''}${sp.noteWait ? '<div class="warn rc-hint">📝 The note is not translated yet — it is added once the visit reaches the server. Open the card again in a minute.</div>' : ''}</div></div>`;
+      box.scrollIntoView({ block: 'start', behavior: 'smooth' }); return;
+    }
+    box.innerHTML = `<img class="rc-img" src="${esc(S.rcUrl)}" alt="${esc(r.alt)}">
+      ${web ? `<button type="button" class="btn ok" style="display:block;width:100%" data-act="rcWaWeb">💬 WhatsApp Web</button>` : ''}
+      ${can && !S.desk ? `<button type="button" class="btn ok" style="display:block;width:100%" data-act="rcShare">📤 Share → WhatsApp</button>` : ''}${/* desk: no 📤 — the Mac share menu's WhatsApp may not be the company account */ ''}
+      <a class="btn ghost" style="display:flex;align-items:center;justify-content:center;width:100%;text-decoration:none;margin-top:8px" href="${esc(S.rcUrl)}" download="${esc(S.rcName)}">⬇️ Save image</a>
+      ${sk ? `<button type="button" class="btn ghost" style="display:block;width:100%;margin-top:8px" data-act="cardSent" data-key="${esc(sk)}">${sentLabel(!!cardsSent()[sk])}</button>` : ''}
+      <div class="muted" style="margin-top:6px;font-size:12px">${hint}</div>`;
+    box.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+  } catch (e) { clearTimeout(slow); box.innerHTML = `<div class="muted">Could not make the image · ${esc(e && e.message || e)}</div>`; }
 }
 async function loadPrivate(id) {
   const ta = $('#drawer #privNotes') || $('#privNotes'); if (!ta || !isBoss()) return;
@@ -2066,21 +2332,22 @@ async function loadPrivate(id) {
   ta.placeholder = 'Only admin sees this';
 }
 // Photos: server/cache copies + anything still waiting on this phone (our own copy).
-async function loadPhotos(cid, parent) {
+async function loadPhotos(cid, parent, net = false) { /* v0.11.1 (#2): the server copy only when asked (📷 Load from server) and at most 12 — a customer page used to pull every photo of the house every time */
   const box = $('#drawer #photoBox') || $('#photoBox'); if (!box) return;
   const seen = new Map();
   const show = () => {
     const b = $('#drawer #photoBox') || $('#photoBox'); if (!b) return;
-    const list = [...seen.values()].filter((x) => typeof x.img === 'string' && (x.img.startsWith('data:image/') || isPdf(x.img))).sort((a, b) => String(b.date || '').localeCompare(String(a.date || '')));
-    b.innerHTML = list.map((x) => figOf(x, `${esc(x.kind || '')} ${esc(x.date || '')}${x.local ? ' · 🟡' : ''}`)).join('') || '<span class="muted">No photos yet</span>';
+    const list = [...seen.values()].filter((x) => typeof x.img === 'string' && (x.img.startsWith('data:image/') || isPdf(x.img))).sort((a, b) => String(a.date || '').localeCompare(String(b.date || ''))); /* v0.14 (#5): a timeline — oldest first */
+    const stage = (x) => String(x.parent || '').startsWith('visits/') ? (x.kind === 'repair' ? '🛠️ repair' : '🔧 visit') : String(x.parent || '').startsWith('customers/') ? '🏠 install' : esc(x.kind || '');
+    b.innerHTML = list.map((x) => figOf(x, `${stage(x)} · ${esc(x.date || '')}${x.local ? ' · 🟡' : ''}`)).join('') || '<span class="muted">No photos yet</span>';
   };
   const mine = (d) => (parent ? d.parent === parent : d.customerId === cid);
   for (const e of myJournal().filter((e) => e.photo && mine(e.data) && e.state !== 'done')) { const img = await photoGet(e.id); if (img) seen.set(e.id, { ...e.data, img, local: true }); }
   show();
   if (DEMO) return;
-  const q = parent ? query(collection(db, 'photos'), where('parent', '==', parent)) : query(collection(db, 'photos'), where('customerId', '==', cid));
+  const q = parent ? query(collection(db, 'photos'), where('parent', '==', parent), qLimit(12)) : query(collection(db, 'photos'), where('customerId', '==', cid), qLimit(12));
   try { (await getDocsFromCache(q)).forEach((d) => seen.set(d.id, { ...d.data(), local: d.metadata.hasPendingWrites })); show(); } catch (e) {}
-  if (navigator.onLine) { try { (await getDocs(q)).forEach((d) => seen.set(d.id, { ...d.data(), local: false })); show(); } catch (e) {} }
+  if (net && navigator.onLine) { try { (await getDocs(q)).forEach((d) => seen.set(d.id, { ...d.data(), local: false })); show(); } catch (e) {} }
 }
 const isPdf = (x) => typeof x === 'string' && x.startsWith('data:application/pdf');
 const thumb = (img) => (isPdf(img) ? `<div class="pdf-tile" data-pdf="1">📄<span>PDF</span></div>` : `<img src="${esc(img)}" alt="" data-full="1">`);
@@ -2126,7 +2393,7 @@ function backupHtml() {
   const last = S.settings.lastBackupAt; const age = last ? R.daysBetween(last, today()) : null;
   return `<div class="sumgrid"><div><span>Last backup</span><b class="num">${last ? esc(last) : '—'}</b></div><div><span>Days ago</span><b class="num" style="color:${age === null || age > 7 ? 'var(--bad)' : 'var(--ok)'}">${age === null ? 'never' : age}</b></div><div><span>Records now</span><b class="num">${COLS.reduce((n, c) => n + S.D[c].size, 0)}</b></div><div><span>Done by</span><b>${esc(S.settings.lastBackupBy || '—')}</b></div></div>
     <div class="card"><div class="status" style="font-size:15px">💾 Back up everything now</div><div class="muted" style="margin:6px 0 10px">One Excel file (a sheet per table, easy to read) + one JSON file (the complete copy). Both go to the Downloads folder of this computer — keep them in the vault / Google Drive. The bell reminds you after 7 days.</div>
-      <label class="ck-line"><input type="checkbox" id="bkPhotos"> include photos (bigger file)</label><button class="btn" data-act="backupNow">💾 Back up now</button></div>
+      <label class="chk-line"><input type="checkbox" id="bkPhotos"> <span>include photos (bigger file)</span></label><button class="btn" data-act="backupNow">💾 Back up now</button></div>
     <div class="card"><div class="status" style="font-size:15px">📂 Check a backup file</div><div class="muted" style="margin:6px 0 10px">Opens a JSON backup and compares its record counts with today — nothing is written back.</div><input type="file" accept=".json,application/json" id="bkCheck"><div id="bkCheckBox"></div></div>
     <div class="card"><div class="status" style="font-size:15px">🛡️ Server-side backup (recommended too)</div><div class="muted" style="margin-top:6px">Firestore can take its own scheduled backups (daily or weekly, kept up to 14 weeks) and point-in-time recovery for 7 days — this needs the Blaze plan and is switched on in the Firebase console (Firestore → Disaster recovery / Backups). The file backup above works on any plan.</div></div>`;
 }
@@ -2180,31 +2447,31 @@ function viewList(p) {
   const head = (title, sub) => `<button class="back" data-back>‹ Back</button><h1>${title}</h1>${sub ? `<div class="muted">${sub}</div>` : ''}`;
   if (k === 'collections') {
     const groups = collectionGroups(m.collections); const cs = R.chaseStats(m.D.checkins, m.D.payments, R.addDays(t, -90), t);
-    return head('💰 Collections', 'G-1 §1-3: 3 days before → reminder · due day → re-remind · +3 → Tara calls · +7 → home visit') +
-      (groups.map((g) => `<h2>${esc(g.label)} <span class="pill">${g.xs.length}</span></h2><div class="card flush">${g.xs.map((x) => dunItem(x)).join('')}</div>`).join('') || '<div class="card empty">Nobody to chase 🎉</div>') +
+    return head('Collections', 'Reminder 3 days before · on the day · 3 days late: Tara calls · 7 days late: home visit') +
+      (groups.map((g) => `<h2>${esc(g.label)} <span class="pill">${g.xs.length}</span></h2><div class="card flush">${g.xs.map((x) => dunItem(x)).join('')}</div>`).join('') || '<div class="card empty">Nobody to chase 🏖️</div>') +
       `<div class="hint">📝 = log a call or visit about the money (who answered, the day they will pay). A home that gave a day waits in “Promised” until then.</div>${chaseStatsLine(cs)}`;
   }
   if (k === 'visits') {
     const byTole = {}; for (const x of m.visitsDue) (byTole[toleOf(x.c)] = byTole[toleOf(x.c)] || []).push(x);
     const toles = Object.entries(byTole).sort((a, b) => b[1].length - a[1].length);
-    return head('🔧 Visits due', 'Grouped by tole so one day covers one area (plan #6). Monthly for 6 months after install, then every 3 months; filter dues pull a visit earlier.') +
+    return head('Visits due', 'Grouped by tole so one day covers one area. Monthly for 6 months after install, then every 3 months; filter dues pull a visit earlier.') +
       (toles.map(([tole, xs]) => `<h2>📍 ${esc(tole)} <span class="pill">${xs.length}</span>${routeLink(xs)}</h2><div class="card flush">${xs.map((x) => cItem(x, `<span class="pill ${x.due < t ? 'bad' : 'warn'}">${esc(x.filterOnly ? 'filter ' + x.due : x.due)}</span>`)).join('')}</div>`).join('') || '<div class="card empty">No visits due</div>');
   }
   if (k === 'calls') {
-    return head('📞 Calls', 'Day 7 happy call (G-1 §3-1) · day 30/60/90 check-ins (plan #7) · quarterly happy call (G-1 §3-2)') +
-      `<div class="card flush">${m.calls.map((x) => `<div class="item" data-go-form="checkin" data-cid="${esc(x.c.id)}" data-kind="${esc(x.o.k === 'Q' ? 'Quarterly call' : x.o.k)}"><span class="dot ${x.o.status === 'overdue' ? 'r' : 'y'}"></span><div class="main"><div class="t">${esc(x.c.name)} · ${esc(x.o.label)}</div><div class="s">due ${esc(x.o.due)} · ${esc(x.c.phone)}</div></div><div class="acts"><a class="icon-btn" href="tel:${esc(x.c.phone)}" data-stop>📞</a></div></div>`).join('') || '<div class="empty">No calls due</div>'}</div>
-      <h2>🎲 Random happy call</h2><div class="card"><div class="muted">Plan #12: pick 3 active customers not called in the last 30 days — for the sister's check.</div><button class="btn ghost" data-act="pickRandom">Pick 3</button><div id="randomBox"></div></div>`;
+    return head('Calls', 'One call 7 days after the install: is the water fine, anything to fix, would a neighbour like a demo?') +
+      `<div class="card flush">${m.calls.map((x) => `<div class="item" data-go-form="checkin" data-cid="${esc(x.c.id)}" data-kind="${esc(x.o.k)}"><span class="dot ${x.o.status === 'overdue' ? 'r' : 'y'}"></span><div class="main"><div class="t">${esc(x.c.name)} · ${esc(x.o.label)}</div><div class="s">due ${esc(x.o.due)} · ${esc(x.c.phone)}</div></div><div class="acts"><a class="icon-btn" href="tel:${esc(x.c.phone)}" data-stop>📞</a></div></div>`).join('') || '<div class="empty">No calls due</div>'}</div>
+      <button class="btn ghost" data-go-form="checkin">📞 Log a call</button>`;
   }
   if (k === 'watch') {
     const g = [['high', '🔴 Look after first'], ['watch', '🟠 Keep an eye on'], ['low', '🔵 Small signs']];
     return head('⚠️ Look after this week', 'Points from signs in the records (late bills, open problems, unhappy calls, first 90 days, moving…). It orders who to call first — it is not a forecast.')
       + g.map(([lv, l]) => { const xs = m.watch.filter((w) => w.lvl === lv); return xs.length ? `<h2>${l} <span class="pill">${xs.length}</span></h2><div class="card flush">${xs.map((w) => watchItem(w)).join('')}</div>` : ''; }).join('')
-      + (m.watch.length ? '' : '<div class="card empty">Nobody to worry about 🎉</div>') + (m.watchChecked ? `<div class="muted" style="margin-top:8px">✓ ${m.watchChecked} checked this week · <a href="#" data-act="watchShowAll">show again</a></div>` : '');
+      + (m.watch.length ? '' : '<div class="card empty">Nobody to worry about 🏖️</div>') + (m.watchChecked ? `<div class="muted" style="margin-top:8px">✓ ${m.watchChecked} checked this week · <a href="#" data-act="watchShowAll">show again</a></div>` : '');
   }
-  if (k === 'requests') return head('📋 Open requests', 'G-1 §2-4 deadlines · 3+ days = red') + `<div class="card flush">${m.openReq.map(reqItem).join('') || '<div class="empty">No open requests</div>'}</div><button class="btn" data-go-form="request">📋 New request</button>`;
+  if (k === 'requests') return head('Open requests', 'Reply within 2 hours in office hours · 3+ days = red') + `<div class="card flush">${m.openReq.map(reqItem).join('') || '<div class="empty">No open requests</div>'}</div><button class="btn" data-go-form="request">📋 New request</button>`;
   if (k === 'tomorrow') {
     const byTole = {}; for (const x of m.tomorrowBills) (byTole[toleOf(x.c)] = byTole[toleOf(x.c)] || []).push(x);
-    return head('📅 Bills due tomorrow', R.addDays(t, 1) + ' · G-1 §1-3 asks for the reminder 3 days before — this is the last easy chance') + (Object.entries(byTole).map(([tole, xs]) => `<h2>📍 ${esc(tole)}</h2><div class="card flush">${xs.map((x) => (x.dn ? dunItem(x) : cItem(x, R.npr(x.led.nextBill.amount - x.led.nextBill.paid)))).join('')}</div>`).join('') || '<div class="card empty">No bills tomorrow</div>');
+    return head('Bills due tomorrow', R.addDays(t, 1) + ' · the reminder goes out 3 days before — this is the last easy chance') + (Object.entries(byTole).map(([tole, xs]) => `<h2>📍 ${esc(tole)}</h2><div class="card flush">${xs.map((x) => (x.dn ? dunItem(x) : cItem(x, R.npr(x.led.nextBill.amount - x.led.nextBill.paid)))).join('')}</div>`).join('') || '<div class="card empty">No bills tomorrow</div>');
   }
   if (k === 'leads') {
     const groups = OPT.leadOutcome.map((o) => ({ o, xs: m.D.leads.filter((l) => (l.outcome || 'New') === o) }));
@@ -2216,7 +2483,7 @@ function viewList(p) {
   if (k === 'recoveries') return head('📦 Recovery cases', 'Recovered / failed / days / cost / why it failed') + `<div class="card flush">${m.D.recoveries.map((r) => { const c = S.D.customers.get(r.customerId); return `<div class="item" data-edit="recovery" data-id="${esc(r.id)}"><span class="dot ${r.outcome === 'Recovered' ? 'g' : String(r.outcome).startsWith('Failed') ? 'r' : 'y'}"></span><div class="main"><div class="t">${esc(c ? c.name : '?')} · ${esc(r.outcome)}</div><div class="s">started ${esc(r.startedDate)} · attempts ${esc(r.attempts ?? '–')}${r.failReason ? ' · ' + esc(r.failReason) : ''}</div></div><div class="r">›</div></div>`; }).join('') || '<div class="empty">No recovery cases</div>'}</div>`;
   if (k === 'filters') {
     const rows = m.filtersAll.filter((f) => f.status !== 'ok').sort((a, b) => String(a.due).localeCompare(String(b.due)));
-    return head('🧪 Filter status', 'E-2 booking intervals (PP 4 / monsoon 3 · CTO 8 · UV 12 · UF 24 months · sanitise 3) — the verdict is what you see on site') +
+    return head('Filter status', 'Booking intervals (PP 4 / monsoon 3 · CTO 8 · UV 12 · UF 24 months · sanitise 3) — the verdict is what you see on site') +
       `<div class="card flush">${rows.map((f) => `<div class="item" data-cust="${esc(f.x.c.id)}"><span class="dot ${f.status === 'overdue' ? 'r' : 'y'}"></span><div class="main"><div class="t">${esc(f.type)} · ${esc(f.x.c.name)}</div><div class="s">${esc(f.why)}</div></div><div class="r"><span class="pill ${f.status === 'overdue' ? 'bad' : 'warn'}">${esc(f.due)}</span></div></div>`).join('') || '<div class="empty">All filters on schedule</div>'}</div>`;
   }
   if (k === 'approvals') {
@@ -2228,7 +2495,7 @@ function viewList(p) {
       <div class="s">${esc(String(r.x.date || r.x.closedDate || r.x.startedDate || '').slice(0, 10))} · by ${esc(who(r.x))}${r.x.discountReason ? ' · ' + esc(r.x.discountReason) : ''}${r.state !== 'Pending' ? ` · ${esc(lbl[r.state] || r.state)} by ${esc(userName(r.x.approvedByUid, r.x.approvedBy))} ${esc(String(r.x.approvedAt || '').slice(0, 10))}` : ''}</div></div>
       ${acts && me && r.state === 'Pending' ? `<div class="wacts" data-stop><button class="btn small ok" data-appr="${esc(r.col)}|${esc(r.x.id)}|Approved">✓ OK</button><button class="btn small ghost" data-appr="${esc(r.col)}|${esc(r.x.id)}|Rejected">✕ No</button></div>` : `<span class="pill ${r.state === 'Pending' ? 'warn' : r.state === 'Approved' ? 'ok' : 'bad'}">${esc(lbl[r.state] || r.state)}</span>`}</div>`;
     return head('✋ Money approvals', `Rules (Settings → Money approvals · 🔴 first guesses): discount over ${R.npr(rule.discountOver)} and deposit refund over ${R.npr(rule.refundOver)} need an OK from ${rule.who === 'Admin only' ? 'Jun (admin)' : 'Jun or anyone with the money right'}. Until then the discount does not reduce the bill and the refund does not leave the deposit book.`) +
-      `<h2>Waiting · ${A.pending.length}</h2><div class="card flush">${A.pending.map((r) => item(r, true)).join('') || '<div class="empty">Nothing waiting 🎉</div>'}</div>
+      `<h2>Waiting · ${A.pending.length}</h2><div class="card flush">${A.pending.map((r) => item(r, true)).join('') || '<div class="empty">Nothing waiting 🏖️</div>'}</div>
       <h2>Decided · last 30</h2><div class="card flush">${A.done.slice(0, 30).map((r) => item(r, false)).join('') || '<div class="empty">Nothing yet</div>'}</div>`;
   }
   if (k === 'relocations') return head('🚚 Relocations', 'Customers moving house: new address, new pin, device moved or swapped.') + `<div class="card flush">${m.D.relocations.slice().sort((a, b) => String(b.moveDate).localeCompare(String(a.moveDate))).map((r) => { const c = S.D.customers.get(r.customerId); return `<div class="item" data-edit="relocation" data-id="${esc(r.id)}"><span class="dot ${r.status === 'Done' ? 'g' : r.status === 'Cancelled' ? 'k' : 'y'}"></span><div class="main"><div class="t">${esc(c ? c.name : '?')} · ${esc(r.status)}</div><div class="s">${esc(r.moveDate || '')} · ${esc(r.oldTole === 'Other' ? r.oldToleOther : r.oldTole || '?')} → ${esc(r.newTole === 'Other' ? r.newToleOther : r.newTole || '?')}</div></div><div class="r">›</div></div>`; }).join('') || '<div class="empty">No relocations</div>'}</div>${can('visit') ? '<button class="btn" data-go-form="relocation">🚚 New relocation</button>' : ''}`;
@@ -2237,12 +2504,12 @@ function viewList(p) {
     const grp = (g) => `<div class="scroll-x"><table class="tbl"><tr><th></th><th class="n">Read so far</th><th class="n">E. coli</th><th class="n">Share</th></tr>${Object.entries(g).sort((a, b) => b[1].n - a[1].n).map(([k2, r]) => `<tr><td>${esc(k2)}</td><td class="n">${r.n}</td><td class="n">${r.pos}</td><td class="n">${pc(r.pos / r.n)}${r.n < 5 ? ' <span class="pill grey">few</span>' : ''}</td></tr>`).join('')}</table></div>`;
     const cn = (id) => esc((S.D.customers.get(id) || {}).name || '?');
     return head('🧫 Raw-water vials', '🚨 Our own check only — never tell a customer the water is safe or unsafe from it; only a lab result is said out loud. Every second install in the PoC (about 25 homes).') +
-      `<div class="card"><div class="kv"><div class="k">Vials filled</div><div class="v num">${V.started} / ${tgt}</div><div class="k">Read so far</div><div class="v num">${V.n}</div><div class="k">E. coli (blue)</div><div class="v num">${V.pos} · ${pc(V.rate)}${V.ci ? ` <span class="muted">(${esc(`95% range ${R.pct(V.ci[0])}–${R.pct(V.ci[1])}`)})</span>` : ''}</div><div class="k">Coliforms (pink)</div><div class="v num">${V.coliforms}</div><div class="k">Waiting to be read</div><div class="v num">${V.waiting.length}</div></div>
+      `<div class="card"><div class="kv"><div class="k">Vials filled</div><div class="v num">${V.started} / ${tgt}</div><div class="k">Read so far</div><div class="v num">${V.n}</div><div class="k">Turned black</div><div class="v num">${V.pos} · ${pc(V.rate)}${V.ci ? ` <span class="muted">(${esc(`95% range ${R.pct(V.ci[0])}–${R.pct(V.ci[1])}`)})</span>` : ''}</div><div class="k">Waiting to be read</div><div class="v num">${V.waiting.length}</div></div>
         <div class="muted" style="margin-top:6px">${esc('Dry-season results — the monsoon can differ. Areas with fewer than 5 read vials cannot be compared.')}</div>
-        <div class="hint" style="margin-top:6px">${esc('🛑 Stop at 2–3 blue homes — that is enough to pick the ENPHO test home (Jun 2026-09-29). If none turn blue, test anyway: it then shows only that the water out meets the standard.')}</div></div>
+        <div class="hint" style="margin-top:6px">${esc('🛑 Stop at 2–3 black vials — that is enough to pick the ENPHO test home. If none turn black, test anyway: it then shows only that the water out meets the standard.')}</div></div>
       <h2>🔬 ENPHO test candidates <span class="pill">${V.enpho.length}</span></h2><div class="card flush">${V.enpho.map((x) => `<div class="item" data-cust="${esc(x.c.id)}"><span class="dot g"></span><div class="main"><div class="t">${esc(x.c.name)}</div><div class="s">${esc(x.c.installDate)} · <span>${esc('test by ' + x.until)}</span> · ${esc(x.c.tole || '')}</div></div></div>`).join('') || `<div class="empty">${esc('None yet — needs blue (E. coli), municipal water and an install within 30 days (PI condition 4).')}</div>`}</div>
       <div class="card"><div class="sec-mini">By water source</div>${grp(V.bySource)}<div class="sec-mini">By area</div>${grp(V.byTole)}</div>
-      <h2>Vials <span class="pill">${m.D.waterTests.length}</span></h2><div class="card flush">${m.D.waterTests.slice().sort((a, b) => String(b.sampledDate).localeCompare(String(a.sampledDate))).map((w) => `<div class="item" data-edit="waterTest" data-id="${esc(w.id)}"><span class="dot ${w.result === R.VIAL_RESULTS[0] ? 'r' : w.result === R.VIAL_RESULTS[1] ? 'y' : w.result ? 'g' : 'b'}"></span><div class="main"><div class="t">${cn(w.customerId)} · <span>${esc(w.result || 'not read yet')}</span></div><div class="s">${esc(w.sampledDate || '')}${w.readDate ? ' → ' + esc(w.readDate) : ''}</div></div><div class="r">›</div></div>`).join('') || '<div class="empty">No vials yet</div>'}</div>
+      <h2>Vials <span class="pill">${m.D.waterTests.length}</span></h2><div class="card flush">${m.D.waterTests.slice().sort((a, b) => String(b.sampledDate).localeCompare(String(a.sampledDate))).map((w) => `<div class="item" data-edit="waterTest" data-id="${esc(w.id)}"><span class="dot ${w.result === R.VIAL_RESULTS[0] ? 'r' : w.result === R.VIAL_RESULTS[2] ? 'y' : w.result ? 'g' : 'b'}"></span><div class="main"><div class="t">${cn(w.customerId)} · <span>${esc(w.result || 'not read yet')}</span></div><div class="s">${esc(w.sampledDate || '')}${w.readDate ? ' → ' + esc(w.readDate) : ''}</div></div><div class="r">›</div></div>`).join('') || '<div class="empty">No vials yet</div>'}</div>
       <button class="btn" data-go-form="waterTest">🧫 New vial</button>`;
   }
   if (k === 'claims') {
@@ -2250,7 +2517,7 @@ function viewList(p) {
     const row = (x) => `<div class="item" data-edit="claim" data-id="${esc(x.c.id)}"><span class="dot ${x.notSentLate ? 'r' : x.open ? 'y' : 'g'}"></span><div class="main"><div class="t">${esc(x.c.what === 'Device' ? x.c.serial : x.c.part || '?')} · <span>${esc(x.c.problem || '')}</span> <span class="pill ${pill[x.c.result || 'Waiting']}">${esc(x.c.result || 'Waiting')}</span></div><div class="s">${esc(x.c.supplier || '')} · ${esc(x.c.foundDate || '')}${x.by ? ' · ' + esc('claim by ' + x.by) : ''}${x.c.sentDate ? ' · ' + esc('sent ' + x.c.sentDate) : x.notSentLate ? ' · ' + esc('not sent — deadline passed') : ''}${x.c.result === 'Credited' ? ' · ' + esc(`credit USD ${x.c.creditUsd || 0}`) : ''}</div></div><div class="r">›</div></div>`;
     return head('📮 Supplier claims', 'PI TQ-PI-20260808: condition 7 — inspect within 14 days of arrival · condition 4 — faulty within 30 days of install = replaced or credited.') +
       `<div class="card"><div class="kv"><div class="k">Open claims</div><div class="v num">${C.open.length}</div><div class="k">Credit to take off the next order</div><div class="v num">USD ${C.creditOpen.toFixed(2)}</div>${Object.entries(C.byResult).map(([k2, n]) => `<div class="k">${esc(k2)}</div><div class="v num">${n}</div>`).join('')}</div></div>
-      <h2>Open claims <span class="pill">${C.open.length}</span></h2><div class="card flush">${C.open.map(row).join('') || '<div class="empty">Nothing open 🎉</div>'}</div>
+      <h2>Open claims <span class="pill">${C.open.length}</span></h2><div class="card flush">${C.open.map(row).join('') || '<div class="empty">Nothing open 🏖️</div>'}</div>
       <h2>All <span class="pill">${C.all.length}</span></h2><div class="card flush">${C.all.map(row).join('') || '<div class="empty">No claims yet</div>'}</div>${canForm('claim') ? '<button class="btn" data-go-form="claim">📮 New claim</button>' : ''}`;
   }
   if (k === 'proof') {
@@ -2273,7 +2540,7 @@ function viewList(p) {
   if (k === 'contract') {
     const open = m.contractOpen; const all = m.D.contractEvents.slice().sort((a, b) => String(b.date).localeCompare(String(a.date)));
     return head('📜 Contract events', 'Notice to end · transfer to a new holder · lost or stolen — following the customer agreement working draft (2026-09-03, still with the lawyer).') +
-      `<h2>To do <span class="pill">${open.length}</span></h2><div class="card flush">${open.map((o) => contractItem(o.e, o)).join('') || '<div class="empty">Nothing open 🎉</div>'}</div>
+      `<h2>To do <span class="pill">${open.length}</span></h2><div class="card flush">${open.map((o) => contractItem(o.e, o)).join('') || '<div class="empty">Nothing open 🏖️</div>'}</div>
       <h2>All <span class="pill">${all.length}</span></h2><div class="card flush">${all.slice(0, 60).map((e) => contractItem(e)).join('') || '<div class="empty">No contract events yet</div>'}</div>${canForm('contract') ? '<button class="btn" data-go-form="contract">📜 New contract event</button>' : ''}`;
   }
   if (k === 'repairs') {
@@ -2300,9 +2567,12 @@ function viewList(p) {
 function viewStatus() {
   const m = model(); const M = m.metrics;
   const j = myJournal(); const pend = j.filter((e) => e.state === 'pending'), rej = j.filter((e) => e.state === 'rejected');
-  const rep = (r, ic, l, s) => `<button class="tile" data-report="${r}"><span class="ic">${ic}</span><span>${l}</span><span class="s">${s}</span></button>`;
+  // v0.11: grouped rows (iPhone Settings style) instead of 37 tiles in one block (Tara 2026-09-30 "too bold · like Instagram settings" · Jun keeps the icon colours)
+  const rep = (r, ic, l, s, ok = true) => (ok ? [{ attr: `data-report="${r}"`, ic, l, s }] : []);
+  const lst = (r, ic, l, s, ok = true) => (ok ? [{ attr: `data-list="${r}"`, ic, l, s }] : []);
+  const money = can('money');
   return `<h1>Status</h1>${statusCard()}
-  <div class="card"><div class="status" style="font-size:15px;justify-content:space-between"><span data-noi18n>🌐 Language · 언어 · भाषा</span> ${langSeg()}</div>${!S.desk && window.innerWidth >= 600 ? '<div class="muted" style="margin-top:6px">🖥️ The command centre opens when this window is at least 960 px wide — make the browser window wider (or full screen).</div>' : ''}</div>
+  <div class="card lang-card"><div class="status" style="font-size:15px;justify-content:space-between"><span data-noi18n>🌐 Language · 언어 · भाषा</span> ${langSeg()}</div>${!S.desk && window.innerWidth >= 600 ? '<div class="muted" style="margin-top:6px">🖥️ The command centre opens when this window is at least 960 px wide — make the browser window wider (or full screen).</div>' : ''}</div>
   <h2>🔔 Alerts <span class="pill ${m.alerts.length ? 'bad' : 'ok'}">${m.alerts.length}</span></h2><div class="card flush">${alertsHtml(m)}</div>
   ${S.swWaiting ? '<button class="btn" data-act="swReload">⬆️ New version ready — tap to update</button>' : ''}
   <div class="card"><div class="grid2">
@@ -2316,37 +2586,23 @@ function viewStatus() {
     ${rej.map((e) => `<div class="warn">Refused: ${esc(e.path)} (${esc(e.err)}) — the data is kept on this phone. Tell Jun.</div>`).join('')}
     <div class="row"><button class="btn ghost" data-act="sync">↻ Send now</button><button class="btn ghost" data-act="full">⟳ Reload all</button></div>
     <button class="btn ghost" data-act="persist">🛡️ Protect phone storage</button></div>
-  <h2>Lists & reports</h2>
-  <div class="grid2">
-    ${can('money') ? rep('payments', '💵', 'Payments', 'all money in') + rep('vat', '🧾', 'VAT by month', 'export CSV') : ''}
-    ${can('money') ? rep('capack', '🧾', 'CA pack', 'IRD sales book · Excel') : ''}${rep('quality', '🩺', 'Data to fix', 'missing GPS · bill no.')}
-    ${can('expense') || can('money') ? rep('expenses', '🧾', 'Expenses', 'bills · input VAT') : ''}${rep('devices', '📦', 'Devices', 'every serial')}
-    <button class="tile" data-list="relocations"><span class="ic">🚚</span><span>Relocations</span><span class="s">moving house</span></button>
-    ${isBoss() ? rep('handover', '🆘', 'If Jun cannot work', 'handover page') + rep('payroll', '💼', 'Payroll', 'SSF · TDS · payslips') : ''}
-    ${can('stock') ? `<button class="tile" data-list="claims"><span class="ic">📮</span><span>Supplier claims</span><span class="s">${m.claimsSt.open.length ? m.claimsSt.open.length + ' open' : 'defects → PI'}</span></button>` : ''}
-    <button class="tile" data-list="water"><span class="ic">🧫</span><span>Raw-water vials</span><span class="s">${m.vials.started} filled · PoC</span></button>
-    <button class="tile" data-list="proof"><span class="ic">✍️</span><span>Proof of visit</span><span class="s">signatures · 30 days</span></button>
-    <button class="tile" data-list="screenings"><span class="ic">🔎</span><span>Screenings</span><span class="s">sign-up checks</span></button>
-    <button class="tile" data-list="contract"><span class="ic">📜</span><span>Contract events</span><span class="s">${m.contractOpen.length ? m.contractOpen.length + ' to do' : 'notice · transfer · lost'}</span></button>
-    ${m.approvals.pending.length || isApprover() ? `<button class="tile" data-list="approvals"><span class="ic">✋</span><span>Money approvals</span><span class="s">${m.approvals.pending.length ? m.approvals.pending.length + ' waiting' : 'discounts · refunds'}</span></button>` : ''}
-    ${can('money') ? rep('billing', '🌊', 'Billing moves', 'new · left · month 14') + rep('deposits', '🏦', 'Deposit book', 'what we hold') + rep('gate', '🧭', 'Direction gate', 'churn · retention · collection') : ''}
-    ${can('stock') ? rep('stock', '📦', 'Stock & FCL', 'order signal') : ''}${rep('learning', '🧪', 'Filter learning', 'real intervals')}${rep('leavers', '🚪', 'Leavers', 'why homes left')}${m.capacity ? rep('capacity', '👷', 'Field capacity', 'jobs vs hands') : ''}${rep('callbacks', '🔁', 'Callbacks', 'problems soon after a job')}${rep('noshows', '🚪', 'Wasted trips', 'nobody home')}${rep('funnel', '⏳', 'Sales stage days', 'lead → first payment')}${can('money') ? rep('perform', '📑', 'Grant KPIs', 'PAYGo PERFORM') : ''}
-    <button class="tile" data-list="map"><span class="ic">🗺️</span><span>Map</span><span class="s">all customers</span></button>
-    <button class="tile" data-list="filters"><span class="ic">🧪</span><span>Filter status</span><span class="s">due & overdue</span></button>
-    <button class="tile" data-list="leads"><span class="ic">🧲</span><span>Leads</span><span class="s">pipeline</span></button>
-    <button class="tile" data-list="recoveries"><span class="ic">📦</span><span>Recoveries</span><span class="s">devices back</span></button>
-    ${rep('trainings', '🎓', 'Trainings', 'records')}${rep('referrals', '🎁', 'Referrals', 'rewards due')}
-    ${rep('help', '❓', 'How to use', 'one page for staff')}
-    ${S.isAdmin ? rep('bank', '🏧', 'Bank CSV match', 'plan #2') + rep('users', '🪪', 'Staff & permissions', 'who can do what') + rep('settings', '⚙️', 'Settings', 'company · calendar · techs') : ''}${can('export') ? rep('export', '💾', 'Export all data', 'backup') : ''}
-  </div>
+  ${rowsHtml([
+    { title: 'Money', tone: 'tone-money', rows: [...rep('payments', '💵', 'Payments', 'all money in', money), ...rep('vat', '🧾', 'VAT by month', 'export CSV', money), ...rep('capack', '🧾', 'CA pack', 'IRD sales book · Excel', money), ...rep('expenses', '🧾', 'Expenses', 'bills · input VAT', can('expense') || money), ...rep('deposits', '🏦', 'Deposit book', 'what we hold', money), ...rep('billing', '🌊', 'Billing moves', 'new · left · month 14', money), ...lst('approvals', '✋', 'Money approvals', m.approvals.pending.length ? m.approvals.pending.length + ' waiting' : 'discounts · refunds', !!(m.approvals.pending.length || isApprover())), ...rep('bank', '🏧', 'Bank CSV match', 'statement → payments', !!S.isAdmin)] },
+    { title: 'Customers', tone: 'tone-field', rows: [...lst('map', '🗺️', 'Map', 'all customers'), ...lst('leads', '🧲', 'Leads', 'pipeline'), ...lst('screenings', '🔎', 'Screenings', 'sign-up checks'), ...lst('contract', '📜', 'Contract events', m.contractOpen.length ? m.contractOpen.length + ' to do' : 'notice · transfer · lost'), ...lst('relocations', '🚚', 'Relocations', 'moving house'), ...lst('recoveries', '📦', 'Recoveries', 'devices back'), ...rep('referrals', '🎁', 'Referrals', 'rewards due', referralOn()), ...rep('leavers', '🚪', 'Leavers', 'why homes left')] },
+    { title: 'Field work', tone: 'tone-call', rows: [...lst('filters', '🧪', 'Filter status', 'due & overdue'), ...lst('proof', '✍️', 'Proof of visit', 'signatures · 30 days'), ...rep('callbacks', '🔁', 'Callbacks', 'problems soon after a job'), ...rep('noshows', '🚪', 'Wasted trips', 'nobody home'), ...rep('capacity', '👷', 'Field capacity', 'jobs vs hands', !!m.capacity), ...lst('water', '🧫', 'Raw-water vials', `${m.vials.started} filled · PoC`), ...rep('learning', '🧪', 'Filter learning', 'real intervals')] },
+    { title: 'Devices & stock', tone: 'tone-dev', rows: [...rep('devices', '📦', 'Devices', 'every serial'), ...rep('stock', '📦', 'Stock & FCL', 'order signal', can('stock')), ...lst('claims', '📮', 'Supplier claims', m.claimsSt.open.length ? m.claimsSt.open.length + ' open' : 'defects → PI', can('stock'))] },
+    { title: 'Reports', tone: 'tone-rep', rows: [...rep('gate', '🧭', 'Direction gate', 'churn · retention · collection', money), ...rep('funnel', '⏳', 'Sales stage days', 'lead → first payment'), ...rep('perform', '📑', 'Grant KPIs', 'PAYGo PERFORM', money), ...rep('quality', '🩺', 'Data to fix', 'missing GPS · bill no.')] },
+    { title: 'Company', tone: 'tone-co', rows: [...rep('users', '🪪', 'Staff & permissions', 'who can do what', !!S.isAdmin), ...rep('settings', '⚙️', 'Settings', 'company · calendar · techs', !!S.isAdmin), ...rep('payroll', '💼', 'Payroll', 'SSF · TDS · payslips', isBoss()), ...rep('handover', '🆘', 'If Jun cannot work', 'handover page', isBoss()), ...rep('trainings', '🎓', 'Trainings', 'records', !!S.isAdmin), ...rep('export', '💾', 'Export all data', 'backup', can('export'))] },
+    { title: 'Help', tone: 'tone-co', rows: [...rep('help', '❓', 'How to use', 'one page for staff')] },
+  ])}
   <div class="card"><div class="row"><button class="btn ghost" data-act="theme">🌓 Theme</button>${window.innerWidth >= 960 ? '<button class="btn ghost" data-act="deskOn">🖥️ Command centre</button>' : ''}</div></div>
-  <div class="card"><div class="status" style="font-size:15px">Diagnostics</div><div class="diag" id="diag">…</div></div>
+  <details class="card diagbox"><summary class="status" style="font-size:15px;cursor:pointer">Diagnostics</summary><div class="diag" id="diag">…</div></details>
   <button class="btn ghost" data-act="signOut">Sign out</button>`;
 }
-const REPORT_PERM = { payroll: 'admin', handover: 'admin', backup: 'admin', payments: 'money', vat: 'money', capack: 'money', deposits: 'money', gate: 'money', billing: 'money', perform: 'money', expenses: 'expenseOrMoney', stock: 'stock', bank: 'admin', users: 'admin', settings: 'admin', export: 'export' };
+const REPORT_PERM = { payroll: 'admin', handover: 'admin', backup: 'admin', payments: 'money', vat: 'money', capack: 'money', deposits: 'money', gate: 'money', billing: 'money', perform: 'money', expenses: 'expenseOrMoney', stock: 'stock', bank: 'admin', users: 'admin', settings: 'admin', export: 'export', trainings: 'adminOnly' };
 export function viewReport(p) {
   const m = model(); const k = p.r;
-  const need2 = REPORT_PERM[k]; const allowed = !need2 || (need2 === 'admin' ? isBoss() : need2 === 'expenseOrMoney' ? can('expense') || can('money') : can(need2));
+  const need2 = REPORT_PERM[k]; const allowed = !need2 || (need2 === 'admin' ? isBoss() : need2 === 'adminOnly' ? !!S.isAdmin : need2 === 'expenseOrMoney' ? can('expense') || can('money') : can(need2));
   if (!allowed) return `<button class="back" data-back>‹ Back</button><div class="card empty">Nothing here.</div>`; // staff must not learn what exists beyond their rights
   const head = (t, s) => `<button class="back" data-back>‹ Back</button><h1>${t}</h1>${s ? `<div class="muted">${s}</div>` : ''}`;
   const custName = (id) => { const c = S.D.customers.get(id); return c ? c.name : '?'; };
@@ -2372,9 +2628,9 @@ export function viewReport(p) {
       (can('stock') ? '<div class="row wrap"><button class="btn" data-go-form="stock">📦 Record stock movement</button><button class="btn ghost" data-go-form="tool">🧰 Add a tool</button></div>' : '') +
       `<h2>Movements</h2><div class="card flush">${m.D.stockMoves.slice().sort((a, b) => String(b.date).localeCompare(String(a.date))).map((s) => `<div class="item" data-edit="stock" data-id="${esc(s.id)}"><div class="main"><div class="t">${esc(s.type)} ${esc(s.qty)} × ${esc(s.item)}</div><div class="s">${esc(s.date)} · ${esc(s.ref || '')}</div></div></div>`).join('') || '<div class="empty">No movements yet</div>'}</div>`;
   }
-  if (k === 'learning') return head('🧪 Filter learning', 'Real days between changes, across all households (plan #9). The booking intervals are E-2 values; PoC data decides the final ones.') +
+  if (k === 'learning') return head('🧪 Filter learning', 'Real days between changes, across all households. The booking intervals are first values; PoC data decides the final ones.') +
     `<div class="card scroll-x"><table class="tbl"><tr><th>Filter</th><th class="n">Booking</th><th class="n">Observed</th><th class="n">Samples</th></tr>${m.learning.map((l) => `<tr><td>${esc(l.type)}</td><td class="n">${l.bookingMonths ? l.bookingMonths + ' mo' : '—'}</td><td class="n">${l.avgMonths ? l.avgMonths.toFixed(1) + ' mo' : '—'}</td><td class="n">${l.n}</td></tr>`).join('')}</table></div>`;
-  if (k === 'trainings') return head('🎓 Training records', 'Plan #12 — name · date · topic · trainer · signed sheet') + `<div class="card flush">${m.D.trainings.slice().sort((a, b) => String(b.date).localeCompare(String(a.date))).map((q) => `<div class="item" data-edit="training" data-id="${esc(q.id)}"><div class="main"><div class="t">${esc(q.person)} · ${esc((q.topic || []).join(', '))}</div><div class="s">${esc(q.date)} · by ${esc(q.trainer)}${q.durationMin ? ' · ' + q.durationMin + ' min' : ''}</div></div></div>`).join('') || '<div class="empty">No training records</div>'}</div><button class="btn" data-go-form="training">🎓 New record</button>`;
+  if (k === 'trainings') return head('🎓 Training records', 'name · date · topic · trainer · signed sheet') + `<div class="card flush">${m.D.trainings.slice().sort((a, b) => String(b.date).localeCompare(String(a.date))).map((q) => `<div class="item" data-edit="training" data-id="${esc(q.id)}"><div class="main"><div class="t">${esc(q.person)} · ${esc((q.topic || []).join(', '))}</div><div class="s">${esc(q.date)} · by ${esc(q.trainer)}${q.durationMin ? ' · ' + q.durationMin + ' min' : ''}</div></div></div>`).join('') || '<div class="empty">No training records</div>'}</div><button class="btn" data-go-form="training">🎓 New record</button>`;
   if (k === 'perform') {
     if (!can('money')) return head('📑 Grant KPIs', '') + '<div class="card"><div class="empty">Money rights needed.</div></div>';
     const pp = p.pp || 'q'; const per = performPeriod(pp, m.t); const P = R.performKpis(m.D, m.ledgers, per.from, per.to, m.t, { back: R.billingMoves(m.D.customers, m.D.recoveries, [], m.t).back });
@@ -2393,7 +2649,7 @@ export function viewReport(p) {
     return head('⏳ Sales stage days', 'How long homes take from first contact to the first payment (installs of the last 12 months). A home is matched to its lead by the convert button or the same phone number. Targets are first guesses (🔴).') +
       `<div class="card"><div class="kv"><div class="k">Lead → first payment</div><div class="v num">${dd(F.totalMedian)} <span class="muted">median</span></div><div class="k">Homes with a lead</div><div class="v num">${F.matched} of ${F.journeys.length}</div><div class="k">Paid on install day</div><div class="v num">${F.paidOnInstall} of ${F.journeys.length}</div></div></div>
       <div class="card scroll-x"><table class="tbl"><tr><th>Step</th><th class="n">Homes</th><th class="n">Median</th><th class="n">Slowest</th><th class="n">Over target</th></tr>${F.steps.map((q) => `<tr><td>${esc(q.label)}</td><td class="n">${q.n}</td><td class="n">${dd(q.median)}</td><td class="n">${dd(q.max)}</td><td class="n">${q.slow || '·'} <span class="muted">(${q.target} d)</span></td></tr>`).join('')}</table></div>
-      <h2>Leads stuck · ${F.stuck.length}</h2><div class="card flush">${F.stuck.map((o) => `<div class="item" data-edit="lead" data-id="${esc(o.l.id)}"><span class="dot ${o.days > 30 ? 'r' : 'y'}"></span><div class="main"><div class="t">${esc(o.l.name || '?')} · ${esc(o.stage === 'New' ? 'New lead' : o.stage)}</div><div class="s">${o.days} days in this stage${o.l.followUpDate ? ' · follow up ' + esc(o.l.followUpDate) : ''}</div></div></div>`).join('') || '<div class="empty">No lead is stuck 🎉</div>'}</div>`;
+      <h2>Leads stuck · ${F.stuck.length}</h2><div class="card flush">${F.stuck.map((o) => `<div class="item" data-edit="lead" data-id="${esc(o.l.id)}"><span class="dot ${o.days > 30 ? 'r' : 'y'}"></span><div class="main"><div class="t">${esc(o.l.name || '?')} · ${esc(o.stage === 'New' ? 'New lead' : o.stage)}</div><div class="s">${o.days} days in this stage${o.l.followUpDate ? ' · follow up ' + esc(o.l.followUpDate) : ''}</div></div></div>`).join('') || '<div class="empty">No lead is stuck 🏖️</div>'}</div>`;
   }
   if (k === 'billing') {
     if (!can('money')) return head('🌊 Billing moves', '') + '<div class="card"><div class="empty">Money rights needed.</div></div>';
@@ -2402,7 +2658,7 @@ export function viewReport(p) {
     return head('🌊 Billing moves', 'Recurring billing each month (VAT incl.) and why it moved: new homes, homes that came back (same phone as a home that left), homes that left, and the month-14 step (1,400 → 1,100 when the 300 deposit part ends — planned, not lost).') +
       `<div class="card scroll-x"><table class="tbl"><tr><th>Month</th><th class="n">Start</th><th class="n">+ New</th><th class="n">+ Came back</th><th class="n">+ Deposit starts</th><th class="n">− Left</th><th class="n">− Month 14</th><th class="n">End</th><th class="n">Net change</th></tr>
       ${BM.rows.slice().reverse().map((r) => `<tr><td class="mono">${esc(r.month)}</td><td class="n">${n(r.start)}</td><td class="n">${r.newAmt ? `${n(r.newAmt)} <span class="muted">(${r.newN})</span>` : '·'}</td><td class="n">${r.backAmt ? `${n(r.backAmt)} <span class="muted">(${r.backN})</span>` : '·'}</td><td class="n">${r.upAmt ? `${n(r.upAmt)} <span class="muted">(${r.upN})</span>` : '·'}</td><td class="n">${r.leftAmt ? `${n(r.leftAmt)} <span class="muted">(${r.leftN})</span>` : '·'}</td><td class="n">${r.stepAmt ? `${n(r.stepAmt)} <span class="muted">(${r.stepN})</span>` : '·'}</td><td class="n"><b>${n(r.end)}</b></td><td class="n"><span class="pill ${r.net < 0 ? 'bad' : r.net > 0 ? 'ok' : 'grey'}">${r.net > 0 ? '+' : ''}${n(r.net)}</span></td></tr>`).join('')}</table>
-      <div class="hint">Start + new + came back + deposit starts − left − month 14 = end. Install month = 1,100 (inside the 4,900), bills 2–13 = 1,400, then 1,100. The deposit part is held, not earned (G-1 §1-2).</div></div>
+      <div class="hint">Start + new + came back + deposit starts − left − month 14 = end. Install month = 1,100 (inside the 4,900), bills 2–13 = 1,400, then 1,100. The deposit part is held, not earned.</div></div>
       <h2>Month-14 steps coming</h2><div class="card"><div class="kv">${BM.ahead.map((a) => `<div class="k">${esc(a.month)}</div><div class="v num">${a.n ? `${a.n} homes · −${n(a.amt)}` : '—'}</div>`).join('')}</div></div>`;
   }
   if (k === 'noshows') {
@@ -2412,20 +2668,20 @@ export function viewReport(p) {
       `<div class="card"><div class="kv"><div class="k">Trips</div><div class="v num">${N.trips}</div><div class="k">Nobody home</div><div class="v num">${N.noShows} · ${pc(N.rate)}</div>
         <div class="k">🛵 Message sent</div><div class="v num">${pc(N.withMsg.rate)} of ${N.withMsg.trips} trips</div><div class="k">No message</div><div class="v num">${pc(N.noMsg.rate)} of ${N.noMsg.trips} trips</div>
         <div class="k">Minutes waited</div><div class="v num">${N.waited}</div></div>${N.withMsg.trips < 30 || N.noMsg.trips < 30 ? '<div class="hint">🔴 Fewer than 30 trips on one side — too early to say whether the message helps.</div>' : ''}</div>
-      <h2>What happened</h2><div class="card"><div class="kv">${Object.entries(N.byReason).sort((a, b) => b[1] - a[1]).map(([k2, v]) => `<div class="k">${esc(k2)}</div><div class="v num">${v}</div>`).join('') || '<div class="empty">Nobody-home trips: none 🎉</div>'}</div></div>
+      <h2>What happened</h2><div class="card"><div class="kv">${Object.entries(N.byReason).sort((a, b) => b[1] - a[1]).map(([k2, v]) => `<div class="k">${esc(k2)}</div><div class="v num">${v}</div>`).join('') || '<div class="empty">Nobody-home trips: none 🏖️</div>'}</div></div>
       <h2>Homes missed twice or more · ${N.repeat.length}</h2><div class="card flush">${N.repeat.map((r) => (r.c ? `<div class="item" data-cust="${esc(r.id)}"><span class="dot r"></span><div class="main"><div class="t">${esc(r.c.name)}</div><div class="s">${r.n} times · last ${esc(r.last)} · ${esc(toleOf(r.c))}</div></div></div>` : '')).join('') || '<div class="empty">None</div>'}</div>
       <h2>By person</h2><div class="card scroll-x"><table class="tbl"><tr><th>Who</th><th class="n">Trips</th><th class="n">Nobody home</th><th class="n">Rate</th></tr>${who.map(([n, r]) => `<tr><td><b>${esc(n)}</b></td><td class="n">${r.trips}</td><td class="n">${r.ns}</td><td class="n">${pc(r.trips ? r.ns / r.trips : null)}</td></tr>`).join('') || '<tr><td colspan="4" class="muted">No trips</td></tr>'}</table></div>
-      <h2>Latest nobody-home trips</h2><div class="card flush">${N.list.slice(0, 25).map((v) => `<div class="item" data-cust="${esc(v.customerId)}"><span class="dot y"></span><div class="main"><div class="t">${esc(cn(v.customerId))} · ${esc(v.noShowReason || 'Nobody home')}</div><div class="s">${esc(String(v.date).slice(0, 10))} · ${esc(v.technician || '—')}${v.omwAt ? ' · 🛵 message sent' : ''}${v.retryDate ? ' · try again ' + esc(v.retryDate) : ''}</div></div></div>`).join('') || '<div class="empty">None 🎉</div>'}</div>`;
+      <h2>Latest nobody-home trips</h2><div class="card flush">${N.list.slice(0, 25).map((v) => `<div class="item" data-cust="${esc(v.customerId)}"><span class="dot y"></span><div class="main"><div class="t">${esc(cn(v.customerId))} · ${esc(v.noShowReason || 'Nobody home')}</div><div class="s">${esc(String(v.date).slice(0, 10))} · ${esc(v.technician || '—')}${v.omwAt ? ' · 🛵 message sent' : ''}${v.retryDate ? ' · try again ' + esc(v.retryDate) : ''}</div></div></div>`).join('') || '<div class="empty">None 🏖️</div>'}</div>`;
   }
   if (k === 'callbacks') {
     const days = Number(S.settings.callbackDays) || R.CALLBACK.days; const C = R.callbackStats(m.D, R.addDays(m.t, -90), m.t, days);
     const lastTrain = {}; for (const q of m.D.trainings) if (q.person && (!lastTrain[q.person] || q.date > lastTrain[q.person])) lastTrain[q.person] = q.date;
     const cn = (id) => (S.D.customers.get(id) || {}).name || '?';
     return head('🔁 Callbacks', `A breakdown, leak or water-quality request within ${days} days after a visit or install at the same home counts against whoever did that job. Last 90 days of jobs.`) +
-      `<div class="card scroll-x"><table class="tbl"><tr><th>Who</th><th class="n">Jobs</th><th class="n">Visits</th><th class="n">Installs</th><th class="n">Callbacks</th><th class="n">Rate</th><th>Last training</th></tr>
-      ${C.people.map((p) => `<tr><td><b>${esc(p.name)}</b></td><td class="n">${p.jobs}</td><td class="n">${p.visits}</td><td class="n">${p.installs}</td><td class="n">${p.callbacks}</td><td class="n">${p.rate === null ? '—' : `<span class="pill ${p.rate > 0.1 ? 'bad' : p.rate > 0.05 ? 'warn' : 'ok'}">${R.pct(p.rate, 1)}</span>`}</td><td class="mono">${esc(lastTrain[p.name] || '—')}</td></tr>`).join('') || '<tr><td colspan="7" class="muted">No jobs in 90 days</td></tr>'}</table>
+      `<div class="card scroll-x"><table class="tbl"><tr><th>Who</th><th class="n">Jobs</th><th class="n">Visits</th><th class="n">Installs</th><th class="n">Callbacks</th><th class="n">Rate</th>${S.isAdmin ? '<th>Last training</th>' : ''}</tr>
+      ${C.people.map((p) => `<tr><td><b>${esc(p.name)}</b></td><td class="n">${p.jobs}</td><td class="n">${p.visits}</td><td class="n">${p.installs}</td><td class="n">${p.callbacks}</td><td class="n">${p.rate === null ? '—' : `<span class="pill ${p.rate > 0.1 ? 'bad' : p.rate > 0.05 ? 'warn' : 'ok'}">${R.pct(p.rate, 1)}</span>`}</td>${S.isAdmin ? `<td class="mono">${esc(lastTrain[p.name] || '—')}</td>` : ''}</tr>`).join('') || '<tr><td colspan="7" class="muted">No jobs in 90 days</td></tr>'}</table>
       <div class="hint">Few jobs = the rate jumps around; read it with the numbers next to it. Colours: over 10 % red · over 5 % orange (🔴 first guess).</div></div>
-      <h2>Callbacks · ${C.callbacks.length}</h2><div class="card flush">${C.callbacks.map((x) => `<div class="item" data-edit="request" data-id="${esc(x.r.id)}"><span class="dot ${x.days <= 7 ? 'r' : 'y'}"></span><div class="main"><div class="t">${esc(cn(x.r.customerId))} · ${esc(x.r.type)}</div><div class="s">${x.days} days after ${esc(x.job.what)} on ${esc(x.job.date)} by ${esc(x.who)}${x.r.description ? ' · ' + esc(String(x.r.description).slice(0, 60)) : ''}</div></div></div>`).join('') || '<div class="empty">No callbacks 🎉</div>'}</div>`;
+      <h2>Callbacks · ${C.callbacks.length}</h2><div class="card flush">${C.callbacks.map((x) => `<div class="item" data-edit="request" data-id="${esc(x.r.id)}"><span class="dot ${x.days <= 7 ? 'r' : 'y'}"></span><div class="main"><div class="t">${esc(cn(x.r.customerId))} · ${esc(x.r.type)}</div><div class="s">${x.days} days after ${esc(x.job.what)} on ${esc(x.job.date)} by ${esc(x.who)}${x.r.description ? ' · ' + esc(String(x.r.description).slice(0, 60)) : ''}</div></div></div>`).join('') || '<div class="empty">No callbacks 🏖️</div>'}</div>`;
   }
   if (k === 'capacity') {
     if (!m.capacity) return head('👷 Field capacity', '') + '<div class="card"><div class="empty">Only for people who see every customer.</div></div>';
@@ -2439,29 +2695,30 @@ export function viewReport(p) {
   }
   if (k === 'leavers') {
     const L = R.leaverStats(m.D.customers, m.D.recoveries, m.t); const lateN = R.lateReasonStats(m.D.payments, m.D.checkins, R.addDays(m.t, -365));
-    const noCase = L.rows.filter((x) => !x.r);
+    const noCase = L.rows.filter((x) => !x.r); const rc = R.recoveryCost(m.D.recoveries);
     return head('🚪 Leavers', 'Why homes left and what it cost. The reason is the main reason on the recovery case. Lost monthly = subscription price (VAT incl.) · lost contract = months left of 36 × price.') +
+      `<div class="card"><div class="kv"><div class="k">Getting the devices back · cost</div><div class="v num">${R.npr(rc.total)}</div><div class="k">Recovery cases · device back</div><div class="v num">${rc.cases} · ${rc.back}</div></div></div>` + /* v0.16 (#20): the cost typed on each case */
       (noCase.length ? `<div class="card note-warn"><b>${noCase.length} leaver(s) without a recovery case</b> — no reason recorded, device and deposit not tracked.<div class="mini-list" style="margin-top:6px">${noCase.map((x) => `<div class="item"><div class="main"><div class="t">${esc(x.c.name)}</div><div class="s">left ${esc(x.end)} · ${x.tenure} months</div></div>${canForm('recovery') ? `<button class="btn small" data-go-form="recovery" data-cid="${esc(x.c.id)}">📦 Record</button>` : ''}</div>`).join('')}</div></div>` : '') +
       `<div class="card scroll-x"><table class="tbl"><tr><th>Left on</th><th>Customer</th><th class="n">Months</th><th>Main reason</th><th>In their words</th><th>Device back</th><th class="n">Contract lost</th></tr>
-      ${L.rows.map((x) => `<tr ${x.r ? `data-edit="recovery" data-id="${esc(x.r.id)}"` : `data-cust="${esc(x.c.id)}"`} style="cursor:pointer"><td class="mono">${esc(x.end)}</td><td><b>${esc(x.c.name)}</b></td><td class="n">${x.tenure}</td><td>${x.reason === 'Not recorded' ? '<span class="pill warn">Not recorded</span>' : esc(x.reason)}</td><td class="muted">${esc(x.detail)}</td><td>${esc(x.outcome || '—')}</td><td class="n">${R.npr(x.lostContract)}</td></tr>`).join('') || '<tr><td colspan="7" class="muted">Nobody has left 🎉</td></tr>'}</table></div>
+      ${L.rows.map((x) => `<tr ${x.r ? `data-edit="recovery" data-id="${esc(x.r.id)}"` : `data-cust="${esc(x.c.id)}"`} style="cursor:pointer"><td class="mono">${esc(x.end)}</td><td><b>${esc(x.c.name)}</b></td><td class="n">${x.tenure}</td><td>${x.reason === 'Not recorded' ? '<span class="pill warn">Not recorded</span>' : esc(x.reason)}</td><td class="muted">${esc(x.detail)}</td><td>${esc(x.outcome || '—')}</td><td class="n">${R.npr(x.lostContract)}</td></tr>`).join('') || '<tr><td colspan="7" class="muted">Nobody has left 🏖️</td></tr>'}</table></div>
       <h2>⏰ Why payments were late · last 12 months</h2><div class="card">${Object.keys(lateN).length ? `<div class="kv">${R.LATE_REASONS.filter((k2) => lateN[k2]).map((k2) => `<div class="k">${esc(k2)}</div><div class="v num">${lateN[k2].total}</div>`).join('')}</div>` : '<div class="empty">No late reasons recorded yet</div>'}<div class="hint">Asked when a late home pays or on a follow-up call. "Money not come in yet" → move the bill day to when money arrives · "No money this month" → a different talk.</div></div>`;
   }
-  if (k === 'referrals') return head('🎁 Referral rewards', 'G-1 §4: new customer — 1 month free (taken off bill 2) · referrer — 1 month free 3 months later, only after install + fee paid · no cash') +
+  if (k === 'referrals') return head('🎁 Referral rewards', 'Only during a campaign (Settings) · the referrer gets 50% off a bill, 3 months after the new home signed up, only after install + fee paid · the new home gets nothing · no cash') +
     `<div class="card flush">${m.referrals.map((r) => `<div class="item"><div class="main"><div class="t">${esc(r.who.name)} · ${r.role === 'referee' ? 'new customer' : 'referrer'}</div><div class="s">${R.npr(r.amount)} · ${r.done ? 'applied ✅' : r.ready ? 'ready' : esc(r.waiting)}</div></div>${!r.done && r.ready && isBoss() ? `<button class="btn small" data-refcredit="${esc(r.who.id)}|${esc(r.forId)}">Apply</button>` : ''}</div>`).join('') || '<div class="empty">No referrals yet</div>'}</div>`;
-  if (k === 'bank') return head('🏧 Bank statement match', 'Plan #2. Upload the bank/Fonepay CSV → match rows to customers by KC code, phone, or a unique amount → create payments. Nothing is saved until you tap Create.') +
+  if (k === 'bank') return head('🏧 Bank statement match', 'Upload the bank/Fonepay CSV → match rows to customers by KC code, phone, or a unique amount → create payments. Nothing is saved until you tap Create.') +
     `<div class="card"><input type="file" accept=".csv,text/csv,.xls,.xlsx" id="bankFile"><div id="bankBox" class="hint">The bank / Fonepay export format is not known yet — any CSV or Excel file with date, amount and description columns works. Send Jun one real file to tune the matching.</div></div>`;
   if (k === 'backup') return head('💾 Backup', 'Everything in one go: customers, visits, payments, expenses, devices… as Excel + JSON.') + backupHtml();
   if (k === 'export') return head('💾 Export all data', 'Backup to this computer (Firestore scheduled backups need the Blaze plan).') +
-    `<div class="card">${COLS.filter((c) => (c !== 'audit' && c !== 'payroll') || isBoss()).map((c) => `<button class="btn ghost" data-csv="col:${c}">⬇️ ${esc(c)} (${S.D[c].size}) CSV</button>`).join('')}<button class="btn" data-act="exportJson">⬇️ Everything as one JSON file</button></div>`;
+    `<div class="card">${COLS.filter((c) => ((c !== 'audit' && c !== 'payroll') || isBoss()) && (c !== 'milestones' || S.isAdmin)).map((c) => `<button class="btn ghost" data-csv="col:${c}">⬇️ ${esc(c)} (${S.D[c].size}) CSV</button>`).join('')}<button class="btn" data-act="exportJson">⬇️ Everything as one JSON file</button></div>`;
   if (k === 'users') return head('🪪 Staff & permissions', 'Admin (Jun) has every right and cannot be changed. Everyone else: pick a preset, then switch single rights. Areas only tidy their screens — they are not a security wall. The server checks who may write money, expenses, new customers and approvals — but every staff account can read the shared records (rights and areas decide what the screens show).') + '<div id="usersBox" class="card">Loading… (needs internet)</div>';
   if (k === 'payroll') {
-    if (S.settings.payroll !== 'Yes') return head('💼 Payroll', '') + `<div class="card"><div class="empty">${esc('Payroll is off (Settings → Staff on payroll?). No salaries before the work permit.')}</div></div>`;
+    if (S.settings.payroll === 'No') return head('💼 Payroll', '') + `<div class="card"><div class="empty">${esc('Payroll is off (Settings → Staff on payroll?). No salaries before the work permit.')}</div></div>`;
     const b0 = B.adToBs(m.t); const [py, pm] = p.pm ? p.pm.split('-').map(Number) : [b0.y, b0.m]; const key = `${py}-${String(pm).padStart(2, '0')}`;
     const { rows, rg, dashain } = payrollRows(m, key); const prev = B.addBsMonths(py, pm, -1), next = B.addBsMonths(py, pm, 1);
     const T = rows.reduce((s2, r) => { for (const k2 of ['gross', 'ssfE', 'ssfR', 'net', 'cost']) s2[k2] += r.P[k2]; s2.tds += r.P.tds || 0; return s2; }, { gross: 0, ssfE: 0, ssfR: 0, net: 0, cost: 0, tds: 0 });
     const n = (x) => (x === null || x === undefined ? '—' : Math.round(x).toLocaleString('en-IN')); const unsaved = rows.filter((r) => !r.sv).length;
     return head('💼 Payroll', 'Nepali month · 🟢 SSF 11% + 20% on the basic salary (SSF procedure §25) · 🟢 TDS from the Inland Revenue 2083/84 table unless the CA\'s is in Settings · a payslip is not a tax filing — the CA checks.') +
-      `<div class="row wrap" style="align-items:center"><button class="btn small ghost" data-report="payroll" data-pm="${prev.y}-${prev.m}">‹</button><b>${esc(B.bsLabel(py, pm))}</b><span class="muted">${esc(rg.from)} → ${esc(rg.to)}</span><button class="btn small ghost" data-report="payroll" data-pm="${next.y}-${next.m}">›</button>${dashain ? '<span class="pill warn">🎉 Dashain month — bonus suggested</span>' : ''}</div>
+      `<div class="row wrap" style="align-items:center"><button class="btn small ghost" data-report="payroll" data-pm="${prev.y}-${prev.m}">‹</button><b>${esc(B.bsLabel(py, pm))}</b><span class="muted">${esc(rg.from)} → ${esc(rg.to)}</span><button class="btn small ghost" data-report="payroll" data-pm="${next.y}-${next.m}">›</button>${dashain ? '<span class="pill warn">🏖️ Dashain month — bonus suggested</span>' : ''}</div>
       ${rows.some((r) => !r.sv && r.P.taxMissing) ? `<div class="card" style="border-color:var(--warn)"><div class="warn">${esc('🔴 No tax table yet — ask the CA for this year\'s TDS table and type it in Settings → Payroll. TDS shows as —.')}</div></div>` : ''}
       ${rows.some((r) => !r.sv && r.P.taxDefault) ? `<div class="card"><div class="hint">${esc('🟢 Tax = the Inland Revenue table for 2083/84 (single = couple) · SSF members pay no 1% band · the CA can replace it in Settings.')}</div></div>` : ''}
       ${rows.some((r) => !r.sv && r.P.noRest) ? `<div class="card" style="border-color:var(--bad)"><div class="warn">${esc('🔴 The tax table has no "rest" line — income above the last bracket would be taxed at 0. Add the last line from the CA.')}</div></div>` : ''}
@@ -2491,9 +2748,14 @@ export function viewReport(p) {
   }
   if (k === 'settings') return head('⚙️ Settings', 'Prices are fixed by the contract (2026-09-03) and shown for reference.') +
     `<form class="card" id="settingsForm"><label>FCL lead time (weeks)</label><input name="leadTimeWeeks" type="number" value="${esc(S.settings.leadTimeWeeks || R.FCL.leadTimeWeeks)}"><div class="hint">Default 13 = the "25 units" rule (8/month × 13 weeks).</div>
-      <label>Extra technician names (comma separated)</label><input name="techNames" value="${esc(S.settings.techNames || '')}" placeholder="e.g. Ramesh, Sita">
-      <label>Extra days the office is closed (YYYY-MM-DD, comma separated)</label><textarea name="holidays" placeholder="e.g. 2026-10-12, 2026-10-13">${esc(S.settings.holidays || '')}</textarea><div class="hint">Saturdays and the official 2083 public holidays (Home Ministry + Gandaki notices) are already in the calendar. Add only your own extra days off. Used for the calendar and the G-1 §2-4 breakdown clock.</div>
+      <label>Extra technician names (comma separated)</label><input name="techNames" value="${esc(S.settings.techNames || '')}" placeholder="e.g. Laxmi, Staff A">
+      <label>Extra days the office is closed (YYYY-MM-DD, comma separated)</label><textarea name="holidays" placeholder="e.g. 2026-10-12, 2026-10-13">${esc(S.settings.holidays || '')}</textarea><div class="hint">Saturdays and the official 2083 public holidays (Home Ministry + Gandaki notices) are already in the calendar. Add only your own extra days off. Used for the calendar and the breakdown reply clock.</div>
+      <h3>🎁 Referral campaign</h3>
+      <label>Referral campaign on?</label><select name="referralCampaign"><option value="No"${referralOn() ? '' : ' selected'}>No — no card, no rewards, no tree (the usual state)</option><option value="Yes"${referralOn() ? ' selected' : ''}>Yes — referrer gets 50% off a bill (switch on when installs slow down)</option></select><div class="hint">Switch on only when installs slow down. NPR ${R.referralAmount()} per neighbour who stays past month 3.</div>
       <h3>🧪 Filters (order dates)</h3>
+      <label>Filter changes</label><select name="filterMode"><option value="Together"${S.settings.filterMode === 'Separate' ? '' : ' selected'}>Together — one visit changes every filter that falls due before the next change</option><option value="Separate"${S.settings.filterMode === 'Separate' ? ' selected' : ''}>Separate — each filter on its own date</option></select><div class="hint">Together: the next change is the earliest due filter; the visit takes every filter due before the one after it.</div>
+      <label>Filter interval from real data</label><select name="learnFilters"><option value="Yes" ${S.settings.learnFilters !== 'No' ? 'selected' : ''}>Yes — once a filter has 5+ real changes, use the observed average</option><option value="No" ${S.settings.learnFilters === 'No' ? 'selected' : ''}>No — always the E-2 booking interval</option></select>
+      <div class="muted" style="margin:-4px 0 10px"><span>Now:</span> ${(() => { const fl = R.filterLearning([...S.D.customers.values()], [...S.D.visits.values()]); return R.FILTER_TYPES.filter((t2) => R.FILTER_MONTHS[t2]).map((t2) => { const r = fl.find((q) => q.type === t2) || {}; return `<span>${esc(`${t2} ${R.FILTER_MONTHS[t2]}mo${r.n >= R.LEARN_MIN && r.avgMonths ? ' → ' + Math.round(r.avgMonths) + 'mo (' + r.n + ' changes)' : ' (' + (r.n || 0) + ' changes)'}`)}</span>`; }).join(' · '); })()}</div>
       <label>Filter lead time — order to shelf (weeks)</label><input name="filterLeadWeeks" type="number" min="0" value="${esc(S.settings.filterLeadWeeks ?? '')}" placeholder="${R.FILTER_ORDER.leadWeeks} (guess)"><div class="hint">🔴 Filters may come from China or India — put the real number after the first order.</div>
       <label>Safety weeks before running out</label><input name="filterSafetyWeeks" type="number" min="0" value="${esc(S.settings.filterSafetyWeeks ?? '')}" placeholder="${R.FILTER_ORDER.safetyWeeks}">
       <label>Months one order should cover</label><input name="filterCoverMonths" type="number" min="1" value="${esc(S.settings.filterCoverMonths ?? '')}" placeholder="${R.FILTER_ORDER.coverMonths}">
@@ -2522,17 +2784,23 @@ export function viewReport(p) {
       <label>Discount needs an OK above (NPR)</label><input name="apprDiscountOver" type="number" min="0" value="${esc(S.settings.apprDiscountOver ?? '')}" placeholder="${R.APPROVAL.discountOver} (every discount)">
       <label>Deposit refund needs an OK above (NPR)</label><input name="apprRefundOver" type="number" min="0" value="${esc(S.settings.apprRefundOver ?? '')}" placeholder="${R.APPROVAL.refundOver} (every refund)">
       <label>Who can give the OK</label><select name="apprWho">${['Admin only', 'Admin or money right'].map((o) => `<option value="${o}"${(S.settings.apprWho || R.APPROVAL.who) === o ? ' selected' : ''}>${o}</option>`).join('')}</select>
+      <h3>📝 Visit note</h3>
+      <label>Buttons on the visit form (one per line: English | नेपाली)</label><textarea name="visitLines" rows="7" data-noi18n placeholder="${esc(VISIT_LINES_DEFAULT.join('\n'))}">${esc(S.settings.visitLines || '')}</textarea><div class="hint">Empty = the six default lines. 🔴 The Nepali needs Tara's check. A visit keeps the words it was saved with.</div>
       <h3>💬 WhatsApp messages</h3>
       <div class="hint">Words in {braces} are filled in: {name} first name · {tech} who is going · {eta} minutes · {time} when you were there · {retry} next try. Empty = the default text. 🔴 The Nepali default needs Tara's check.</div>
       ${[['omwEn', '🛵 On my way — English'], ['omwNe', '🛵 On my way — Nepali'], ['missEn', '🚪 Sorry we missed you — English'], ['missNe', '🚪 Sorry we missed you — Nepali']].map(([k2, l]) => `<label>${esc(l)}</label><textarea name="${k2}" rows="3" data-noi18n placeholder="${esc(MSG_DEFAULTS[k2])}">${esc(S.settings[k2] || '')}</textarea>`).join('')}
       <h3>🗓️ Calendar</h3>
       <label>Payday — day of the Nepali month</label><input name="payday" value="${esc(S.settings.payday ?? '')}" placeholder="empty = last day · e.g. 1 · off"><div class="hint">Shown in the company calendar. Empty = the last day of each Nepali month. Type "off" to hide it.</div>
       <label>TDS table from the CA (one line per bracket: yearly amount up to, rate %; last line: rest, rate %)</label><textarea name="taxTable" rows="4" data-noi18n placeholder="${esc(R.TAX_DEFAULT.replace(/\n/g, ' · '))}">${esc(S.settings.taxTable || '')}</textarea><div class="hint">Empty = the Inland Revenue table for 2083/84 (🟢, single = couple). SSF members pay no 1% band. Type the CA's table here to replace it.</div>
-      <label>Staff on payroll?</label><select name="payroll"><option value="No"${S.settings.payroll === 'Yes' ? '' : ' selected'}>No — no salaries yet</option><option value="Yes"${S.settings.payroll === 'Yes' ? ' selected' : ''}>Yes — show TDS and SSF deadlines</option></select>
+      <label>Staff on payroll?</label><select name="payroll"><option value="No"${S.settings.payroll === 'No' ? ' selected' : ''}>No — no salaries yet</option><option value="Yes"${S.settings.payroll === 'No' ? '' : ' selected'}>Yes — show TDS and SSF deadlines</option></select>
       <h3>🧾 Company (for the CA pack)</h3>
-      <label>Legal company name</label><input name="coName" value="${esc(S.settings.coName || '')}" placeholder="as on the PAN / VAT certificate">
+      <label>Legal company name</label><input name="coName" value="${esc(S.settings.coName || '')}" placeholder="Kora Care Private Limited (as on the PAN / VAT certificate)"><div class="hint">The first line of every customer picture, in capitals.</div>
+      <label>Legal name in Nepali</label><input name="coNameNe" value="${esc(S.settings.coNameNe || '')}" data-noi18n placeholder="कोरा केयर प्राइभेट लिमिटेड"><div class="hint">Empty = the registered name (OCR certificate).</div>
       <label>Company PAN (VAT)</label><input name="coPan" value="${esc(S.settings.coPan || '')}" inputmode="numeric" placeholder="9 digits">
       <label>Address</label><input name="coAddress" value="${esc(S.settings.coAddress || '')}" placeholder="e.g. Pokhara-13, Kaski">
+      <label>Company WhatsApp number</label><input name="coPhone" value="${esc(S.settings.coPhone || '')}" placeholder="+977 9xx-xxxxxxx" hint="on the image receipt">
+      <label>Company payment QR (bank account QR)</label><div class="row" style="align-items:center;gap:10px;margin:2px 0 8px"><span class="qr-prev">${S.settings.coQr ? `<img src="${esc(S.settings.coQr)}" alt="QR">` : '<span class="muted">none yet</span>'}</span><label class="btn small ghost" style="margin:0">📷 Upload QR<input type="file" id="coQrIn" accept="image/*" hidden></label>${S.settings.coQr ? '<button type="button" class="btn small ghost" data-coqr-remove>Remove</button>' : ''}</div><div class="hint">The picture the customer scans from their gallery (bill + QR card). Saved the moment you pick it — the QR is never written into the app code.</div>
+      <label>Bank line under the QR</label><input name="coBankLine" value="${esc(S.settings.coBankLine || '')}" placeholder="bank · account name · account number"><div class="hint">For customers whose app cannot read the QR — type the transfer details.</div>
       <label>Nepali calendar fix (only if the CA says a month length is wrong)</label><textarea name="bsOverride" placeholder="2084: 31,32,31,32,31,30,30,30,29,29,30,31">${esc(S.settings.bsOverride || '')}</textarea><div class="hint">Years 2080–2083 are checked against 3 sources. From 2084 the sources disagree — put the official month lengths here when the calendar is out.</div>
       ${S.isAdmin ? '<button class="btn" type="submit">Save settings</button>' : '<div class="hint">Only Jun (admin) changes settings — the deputy can read them.</div>'}</form>
     <div class="card"><div class="kv"><div class="k">Day 1</div><div class="v">${R.npr(R.PRICES.installFee)}</div><div class="k">Months 2–13</div><div class="v">${R.npr(R.PRICES.monthly + R.PRICES.depositMonthly)} (incl. deposit ${R.PRICES.depositMonthly})</div><div class="k">Months 14–36</div><div class="v">${R.npr(R.PRICES.monthly)}</div><div class="k">Deposit</div><div class="v">${R.npr(R.PRICES.depositTotal)}</div></div></div>`;
@@ -2540,10 +2808,11 @@ export function viewReport(p) {
   if (k === 'help') return head('❓ How to use KORA Field', 'One page for Tara and technicians') + `
     <div class="card"><h3>The dot at the top</h3><div class="kv"><div class="k"><span class="dot g"></span></div><div class="v">Everything is on the server.</div><div class="k"><span class="dot y"></span></div><div class="v">Saved on this phone. It sends by itself when there is internet — keep working.</div><div class="k"><span class="dot r"></span></div><div class="v">Something is wrong. Write it on paper and tell Jun.</div></div></div>
     <div class="card"><h3>No internet? No problem</h3>• Every save goes to the phone first, twice (two stores).<br>• Photos too — they upload later.<br>• Open the app from the <b>home-screen icon</b>, not a Safari tab.<br>• 🚨 <b>Never clear Safari history / website data</b> on this phone while records are waiting.<br>• Tap <b>Status → Protect phone storage</b> once.</div>
-    <div class="card"><h3>New install (E-1)</h3>1. Measure raw TDS and pressure first.<br>2. Install, leak test twice, pump quiet, UV lamp on.<br>3. Measure purified TDS and flow (UV: 1.2 L/min or less).<br>4. Tick all checks · take the 3 photos (device, TDS meter, signed contract).<br>5. Day-1 payment NPR 4,900 by QR — the install is not finished before it is confirmed (G-1 §1-1).</div>
-    <div class="card"><h3>Visits (E-2 · G-1 §2)</h3>• Look at the PP filter: brown or black → replace now.<br>• One old filter back for every new one.<br>• A completed visit needs photos, TDS after, and the next visit date.<br>• Sanitise pipes every 3 months — tick it on the visit.</div>
-    <div class="card"><h3>Money (G-1 §1)</h3>• Bill = same day each month as the install day. Months 2–13: 1,400 (1,100 + 300 deposit). From month 14: 1,100.<br>• 3 days before → WhatsApp reminder · due day → remind again · +3 days → Tara calls · +7 days → home visit.<br>• Only Tara takes cash. Everyone else: Khalti / eSewa / Fonepay QR.<br>• Send the receipt from the customer page — the deposit is on its own line.</div>
-    <div class="card"><h3>Breakdowns (G-1 §2-4)</h3>Office hours → reply within 2 hours, visit today or tomorrow. After 17:00 → reply today, visit tomorrow. Saturday → reply next morning. 3+ days = red.</div>`;
+    <div class="card"><h3>New install</h3>1. Measure raw TDS and pressure first.<br>2. Install, leak test twice, pump quiet, UV lamp on.<br>3. Measure purified TDS and flow (UV: 1.2 L/min or less).<br>4. Tick all checks · take the 3 photos (device, TDS meter, signed contract).<br>5. Day-1 payment NPR 4,900 by QR — the install is not finished before it is confirmed.</div>
+    <div class="card"><h3>Visits</h3>• Look at the PP filter: brown or black → replace now.<br>• One old filter back for every new one.<br>• A completed visit needs photos, TDS after, and the next visit date.<br>• Sanitise pipes every 3 months — tick it on the visit.</div>
+    <div class="card"><h3>The day-7 call</h3>One call 7 days after every install — Tara calls or WhatsApps the home.<br>• Is the water fine? Anything to fix? (a fault found early is a cheap one)<br>• The home feels looked after — that is what keeps it with us.<br>• Would a neighbour or relative like a demo?<br>Log it under New → Check-in call. No other routine calls: the monthly visits cover the rest. A late bill is chased from Collections, not from here.</div>
+    <div class="card"><h3>Money</h3>• Bill = same day each month as the install day. Months 2–13: 1,400 (1,100 + 300 deposit). From month 14: 1,100.<br>• 3 days before → WhatsApp reminder · due day → remind again · +3 days → Tara calls · +7 days → home visit.<br>• Only Tara takes cash. Everyone else: Khalti / eSewa / Fonepay QR.<br>• Send the receipt from the customer page — the deposit is on its own line.</div>
+    <div class="card"><h3>Breakdowns</h3>Office hours → reply within 2 hours, visit today or tomorrow. After 17:00 → reply today, visit tomorrow. Saturday → reply next morning. 3+ days = red.</div>`;
   return head('Report', '') + '<div class="card">Unknown report</div>';
 }
 // Missing data that breaks reports or slows the field (plan: data you can trust before PoC numbers are read).
@@ -2583,7 +2852,7 @@ export function devicesHtml(m, p) {
   const cname = (id) => { const c = S.D.customers.get(id); return c ? c.name : ''; };
   const checks = m.devices.filter((d) => d.checkDue); const doa = m.devices.filter((d) => d.doaUntil && d.doaUntil >= m.t && d.status === 'At a customer');
   return `<div class="bs-chips"><button data-devf="all" class="${f === 'all' ? 'on' : ''}">All ${m.devices.length}</button>${R.DEVICE_STATES.map((st) => `<button data-devf="${esc(st)}" class="${f === st ? 'on' : ''}">${esc(st)} ${counts[st]}</button>`).join('')}</div>
-    ${checks.length ? `<div class="card" style="border-color:var(--warn)"><div class="warn">📦 ${checks.length} device(s) not checked yet — PI terms: inspect within 14 days of arrival (${esc(checks.map((d) => d.checkDue).sort()[0])} is the first deadline).</div></div>` : ''}
+    ${checks.length ? `<div class="warn">📦 ${checks.length} device(s) not checked yet — PI terms: inspect within 14 days of arrival (${esc(checks.map((d) => d.checkDue).sort()[0])} is the first deadline).</div>` : ''}
     ${doa.length ? `<div class="muted">🛡️ ${doa.length} installed device(s) still inside the 30-day dead-on-arrival claim window.</div>` : ''}
     <div class="muted"><span>Stock by count (stock movements):</span> <b>${m.metrics.stock.Device ?? 0}</b> · <span>In stock by serial:</span> <b>${counts['In stock']}</b>${(m.metrics.stock.Device ?? 0) !== counts['In stock'] ? ' <span>— different: register the serials of the shipment (Device event → Received).</span>' : ''}</div>
     ${can('stock') ? '<button class="btn" data-go-form="device">📦 Device event (arrival · check · refurbish)</button>' : ''}
@@ -2642,6 +2911,8 @@ function staffCard(u, mk) {
   return `<div class="card staff" data-staff="${esc(u.uid)}">
     <div class="st-h"><span class="avatar">${esc((u.name || u.email || '?').slice(0, 1).toUpperCase())}</span><div class="main"><b>${esc(u.name || '(no name yet)')}</b><div class="muted">${esc(u.email || u.uid)} · last seen ${esc(seen)}${u.appVersion ? ' · ' + esc(u.appVersion) : ''}</div></div><span class="pill ${pill}">${esc(u.role === 'staff' ? 'active' : u.role || '?')}</span></div>
     <label>Name (shown on records)</label><input data-uname value="${esc(u.name || '')}" placeholder="e.g. Tara">
+    <label>Full name (on the visit note / installed card)</label><input data-ufull value="${esc(u.fullName || '')}" placeholder="e.g. Tara Sherpa">
+    <div class="row" style="align-items:center;gap:10px;margin:4px 0 8px"><span class="avatar photo" data-uav>${u.photo ? `<img src="${esc(u.photo)}" alt="">` : esc((u.name || u.email || '?').slice(0, 1).toUpperCase())}</span><label class="btn small ghost" style="margin:0">📷 Photo<input type="file" accept="image/*" data-uphoto="${esc(u.uid)}" hidden></label><span class="muted">round photo on the customer cards · face, good light</span></div>
     <div class="lbl">Preset</div><div class="tgl-row">${Object.entries(PRESETS).map(([k, pr]) => `<button type="button" class="tgl ${u.preset === k ? 'on' : ''}" data-preset="${k}">${esc(pr.label)}</button>`).join('')}</div>
     <div class="lbl">Rights</div><div class="perm-grid">${PERMS.map(([k, l, h]) => `<button type="button" class="tgl perm ${perms[k] ? 'on' : ''}" data-perm="${k}" title="${esc(h || '')}"><span class="ck">${perms[k] ? '✓' : ''}</span>${esc(l)}</button>`).join('')}</div>
     <div class="lbl">Areas (only if “See every customer” is off)</div><div class="tgl-row">${OPT.tole.map((t) => `<button type="button" class="tgl small ${toles.has(t) ? 'on' : ''}" data-area="${esc(t)}">${esc(t)}</button>`).join('')}</div>
@@ -2652,12 +2923,13 @@ function staffCard(u, mk) {
     ${own ? '<div class="hint">Your own account — Jun changes it.</div>' : ''}<div class="row wrap"${own ? ' hidden' : ''}>${u.role === 'staff' ? `<button class="btn" data-staffsave="${esc(u.uid)}">Save rights</button>${u.email ? `<button class="btn ghost" data-staffreset="${esc(u.email)}">📧 Password link</button>` : ''}<button class="btn ghost" data-staffrole="blocked" data-uid="${esc(u.uid)}">Block</button>` : u.role === 'blocked' ? `<button class="btn ghost" data-staffrole="staff" data-uid="${esc(u.uid)}">Unblock</button>` : `<button class="btn ok" data-staffsave="${esc(u.uid)}" data-approve="1">Approve with these rights</button><button class="btn ghost" data-staffrole="blocked" data-uid="${esc(u.uid)}">Block</button>`}</div>
   </div>`;
 }
-export function staffMatrix(users, admins = []) {
+export function staffMatrix(users, admins = [], sel = '') {
   const act = users.filter((u) => u.role === 'staff'); const me = String((S.user && S.user.email) || '').toLowerCase();
-  const adminRow = (nm) => `<tr><td><b>${esc(nm)}</b> <span class="pill blue">admin</span></td>${PERMS.map(() => '<td class="y">✓</td>').join('')}<td>all</td></tr>`;
+  const pick = (id) => (sel ? ` data-staffpick="${esc(id)}"${id === sel ? ' class="sel"' : ''}` : ''); /* v0.17.0 (3) B2: a row picks that person's card (desk) */
+  const adminRow = (nm, mine) => `<tr${mine ? pick('me') : ''}><td><b>${esc(nm)}</b> <span class="pill blue">admin</span></td>${PERMS.map(() => '<td class="y">✓</td>').join('')}<td>all</td></tr>`;
   return `<div class="scroll-x"><table class="tbl matrix"><tr><th>Who</th>${PERMS.map(([k, l]) => `<th title="${esc(l)}">${esc(PERM_SHORT[k])}</th>`).join('')}<th>Areas</th></tr>
-    ${adminRow(myName())}${admins.filter((u) => String(u.email || '').toLowerCase() !== me).map((u) => adminRow(u.name || u.email)).join('')}
-    ${act.map((u) => { const pr = u.perms || PRESETS.office.perms; return `<tr><td><b>${esc(u.name || u.email)}</b></td>${PERMS.map(([k]) => `<td class="${pr[k] ? 'y' : 'n'}">${pr[k] ? '✓' : '·'}</td>`).join('')}<td>${pr.seeAll ? 'all' : esc((u.toles || []).join(', ') || '—')}</td></tr>`; }).join('')}</table></div>`;
+    ${adminRow(myName(), true)}${admins.filter((u) => String(u.email || '').toLowerCase() !== me).map((u) => adminRow(u.name || u.email)).join('')}
+    ${act.map((u) => { const pr = u.perms || PRESETS.office.perms; return `<tr${pick(u.uid)}><td><b>${esc(u.name || u.email)}</b></td>${PERMS.map(([k]) => `<td class="${pr[k] ? 'y' : 'n'}">${pr[k] ? '✓' : '·'}</td>`).join('')}<td>${pr.seeAll ? 'all' : esc((u.toles || []).join(', ') || '—')}</td></tr>`; }).join('')}</table></div>`;
 }
 async function loadUsers() {
   const box = $('#drawer #usersBox') || $('#usersBox'); if (!box) return;
@@ -2668,22 +2940,43 @@ async function loadUsers() {
     const rows = all.filter((u, i) => !adm[i]).sort((a, b) => ({ pending: 0, staff: 1, blocked: 2 }[a.role] ?? 3) - ({ pending: 0, staff: 1, blocked: 2 }[b.role] ?? 3));
     S.usersCache = rows; const mk = R.monthKey(today());
     const box2 = $('#drawer #usersBox') || $('#usersBox'); if (!box2) return;
-    box2.innerHTML = newStaffHtml() + `<div class="card"><div class="status" style="font-size:15px">Who can do what</div>${staffMatrix(rows, admins)}</div>`
+    if (S.desk) { box2.innerHTML = staffDeskHtml(rows, admins, mk); return; }
+    box2.innerHTML = newStaffHtml() + myCardHtml() + `<div class="card"><div class="status" style="font-size:15px">Who can do what</div>${staffMatrix(rows, admins)}</div>`
       + (rows.map((u) => staffCard(u, mk)).join('') || '<div class="card empty">No staff yet. Someone signs in with their email → they appear here as pending.</div>');
   } catch (e) { box.textContent = 'Could not load users: ' + (e.code || e.message); }
 }
+function staffDeskHtml(rows, admins, mk) { /* v0.17.0 (3) B2 · (6): one long phone column with 1,354-px buttons → new account on one line · pick a person on the left · their card on the right */
+  const others = rows.filter((u) => u.role !== 'staff'); /* pending · blocked: not in the rights table, picked from their own list */
+  const ids = ['me', ...rows.map((u) => u.uid)]; const first = (rows.find((u) => u.role === 'pending') || rows.find((u) => u.role === 'staff') || { uid: 'me' }).uid;
+  const sel = ids.includes(S.staffSel) ? S.staffSel : first; S.staffSel = sel;
+  const cards = myCardHtml().replace('class="card staff my"', `class="card staff my${sel === 'me' ? ' sel' : ''}"`) + rows.map((u) => staffCard(u, mk).replace('<div class="card staff"', `<div class="card staff${u.uid === sel ? ' sel' : ''}"`)).join('');
+  return `<div class="staff-desk"><div class="sd-top">${newStaffHtml()}</div>
+    <div class="sd-left"><div class="card"><div class="status" style="font-size:15px">Who can do what <span class="muted" style="font-weight:500;font-size:13px">· pick a person</span></div>${staffMatrix(rows, admins, sel)}</div>${others.length ? `<div class="card"><div class="status" style="font-size:15px">Waiting · blocked</div><div class="mini-list">${others.map((u) => `<div class="item${u.uid === sel ? ' sel' : ''}" data-staffpick="${esc(u.uid)}"><span class="dot ${u.role === 'pending' ? 'y' : 'k'}"></span><div class="main"><div class="t">${esc(u.name || '(no name yet)')}</div><div class="s">${esc(u.email || u.uid)} · ${esc(u.role)}</div></div></div>`).join('')}</div></div>` : ''}${rows.length ? '' : '<div class="card empty">No staff yet. Someone signs in with their email → they appear here as pending.</div>'}</div>
+    <div class="sd-right">${cards}</div></div>`;
+}
+export function staffPick(id) { S.staffSel = id; for (const c of document.querySelectorAll('.staff-desk .card.staff')) c.classList.toggle('sel', c.dataset.staff === id); for (const r of document.querySelectorAll('.staff-desk [data-staffpick]')) r.classList.toggle('sel', r.dataset.staffpick === id); }
 function readStaffCard(card) {
   const perms = {}; card.querySelectorAll('[data-perm]').forEach((b) => { perms[b.dataset.perm] = b.classList.contains('on') ? 1 : 0; });
   const toles = [...card.querySelectorAll('[data-area].on')].map((b) => b.dataset.area);
   const pre = card.querySelector('[data-preset].on');
-  return { name: card.querySelector('[data-uname]').value.trim(), perms, toles, preset: pre ? pre.dataset.preset : 'custom' };
+  const d = { name: card.querySelector('[data-uname]').value.trim(), fullName: (card.querySelector('[data-ufull]') || { value: '' }).value.trim().slice(0, 80), perms, toles, preset: pre ? pre.dataset.preset : 'custom' };
+  if (card.dataset.photo) d.photo = card.dataset.photo; /* v0.15: a new photo picked on this card */
+  return d;
 }
 // New staff account made by Jun: a second Firebase app signs the new person up (Jun stays signed in),
 // with a random password nobody sees — the staff member gets an email to set their own password, then stays signed in on their phone.
+// v0.16 #3: the admin's own card — full name + photo for the visit note / installed card (users/{uid}.fullName · .photo; the profile on this phone)
+function myCardHtml() {
+  const p = S.profile || {}; const init = (myName() || '?').slice(0, 1).toUpperCase();
+  return `<div class="card staff my" data-staff="me"><div class="st-h"><span class="avatar photo" data-uav>${p.photo ? `<img src="${esc(p.photo)}" alt="">` : esc(init)}</span><div class="main"><b>${esc(myName())} <span>(you)</span></b><div class="muted">${S.isAdmin ? 'admin' : 'staff'} · what the customer cards show when you did the visit</div></div><span class="pill blue">${S.isAdmin ? 'admin' : 'me'}</span></div>
+    <label>Full name (on the visit note / installed card)</label><input data-ufull value="${esc(p.fullName || '')}" placeholder="your full name">
+    <div class="row" style="align-items:center;gap:10px;margin:4px 0 8px"><label class="btn small ghost" style="margin:0">📷 Photo<input type="file" accept="image/*" data-uphoto="me" hidden></label><span class="muted">round photo on the customer cards · face, good light</span></div>
+    <div class="row"><button type="button" class="btn" data-mysave>Save my card</button></div></div>`;
+}
 function newStaffHtml() {
   return `<div class="card staff-new"><div class="status" style="font-size:15px">➕ New staff account</div>
     <div class="muted">They get an email to set their own password. After they sign in once, the phone stays signed in.</div>
-    <div class="grid2"><div><label>Name</label><input id="nsName" placeholder="e.g. Ramesh"></div><div><label>Email</label><input id="nsEmail" type="email" inputmode="email" placeholder="their own email"></div></div>
+    <div class="grid2"><div><label>Name</label><input id="nsName" placeholder="e.g. Laxmi"></div><div><label>Email</label><input id="nsEmail" type="email" inputmode="email" placeholder="their own email"></div></div>
     <div class="lbl">Preset</div><div class="tgl-row" id="nsPreset">${Object.entries(PRESETS).map(([k, pr]) => `<button type="button" class="tgl ${k === 'technician' ? 'on' : ''}" data-nspreset="${k}">${esc(pr.label)}</button>`).join('')}</div>
     <button class="btn" data-act="staffCreate">Create account &amp; send the email</button><div class="hint" id="nsOut"></div></div>`;
 }
@@ -2787,14 +3080,6 @@ export function csvFor(kind) {
   if (kind.startsWith('col:')) { const col = kind.slice(4); const rows = arr(col).map(({ _pending, _localT, ...x }) => x); const keys = [...new Set(rows.flatMap((r) => Object.keys(r)))].filter((k) => k !== 'img'); return R.toCSV(rows, keys.map((k) => ({ key: k, get: (r) => (r[k] && r[k].toMillis ? new Date(r[k].toMillis()).toISOString() : r[k]) }))); }
   return '';
 }
-function pickRandomCalls() {
-  const m = model(); const since = R.addDays(m.t, -30);
-  const recent = new Set(m.D.checkins.filter((c) => c.date >= since).map((c) => c.customerId));
-  const pool = [...m.cust.values()].filter((x) => x.status === 'Active' && !recent.has(x.c.id));
-  const pick = R.pickRandom(pool, 3);
-  const box = $('#drawer #randomBox') || $('#randomBox');
-  if (box) box.innerHTML = pick.map((x) => `<div class="item" data-go-form="checkin" data-cid="${esc(x.c.id)}" data-kind="Random happy call"><div class="main"><div class="t">${esc(x.c.name)}</div><div class="s">${esc(x.c.phone)} · ${esc(toleOf(x.c))}</div></div><div class="acts"><a class="icon-btn" href="tel:${esc(x.c.phone)}" data-stop>📞</a></div></div>`).join('') || '<div class="empty">Everyone was called in the last 30 days</div>';
-}
 // Excel files are converted with SheetJS (vendored, loaded only here).
 function loadXlsx() { return window.XLSX ? Promise.resolve(window.XLSX) : new Promise((res, rej) => { const s = document.createElement('script'); s.src = './vendor/xlsx.full.min.js'; s.onload = () => res(window.XLSX); s.onerror = rej; document.head.appendChild(s); }); }
 function bankUpload(file) {
@@ -2821,10 +3106,10 @@ function bankRows(rows, box) {
 function bankMatch() {
   const g = (id) => $('#drawer #' + id) || $('#' + id);
   const map = { date: Number(g('bmDate').value), amount: Number(g('bmAmt').value), desc: Number(g('bmDesc').value) };
-  const res = R.matchBankRows(S.bankRows || [], map, arr('customers'), model().ledgers).filter((r) => r.amount > 0);
+  const res = R.matchBankRows(S.bankRows || [], map, arr('customers'), model().ledgers, arr('payments')).filter((r) => r.amount > 0);
   S.bankMatches = res;
   const out = g('bankRes');
-  out.innerHTML = `<table class="tbl" style="margin-top:10px"><tr><th></th><th>Date</th><th class="n">NPR</th><th>Match</th></tr>${res.map((r) => `<tr><td><input type="checkbox" data-bank="${r.i}" ${r.customer ? 'checked' : 'disabled'} style="min-height:auto;width:auto"></td><td>${esc(r.date)}</td><td class="n">${r.amount}</td><td>${r.customer ? `${esc(custLabel(r.customer))} <span class="pill blue">${esc(r.how)}</span>` : `<span class="muted">${esc(r.desc.slice(0, 40))}</span>`}</td></tr>`).join('')}</table>
+  out.innerHTML = `<table class="tbl" style="margin-top:10px"><tr><th></th><th>Date</th><th class="n">NPR</th><th>Match</th></tr>${res.map((r) => `<tr><td><input type="checkbox" data-bank="${r.i}" ${r.customer && !r.dup ? 'checked' : r.customer ? '' : 'disabled'} style="min-height:auto;width:auto"></td><td>${esc(r.date)}</td><td class="n">${r.amount}</td><td>${r.customer ? `${esc(custLabel(r.customer))} <span class="pill blue">${esc(r.how)}</span>${r.dup ? ' <span class="pill warn">already recorded</span>' : ''}` : `<span class="muted">${esc(r.desc.slice(0, 40))}</span>`}</td></tr>`).join('')}</table>
     <button class="btn" data-act="bankCreate" type="button">Create ${res.filter((r) => r.customer).length} payments</button>`;
 }
 
@@ -2838,7 +3123,9 @@ document.addEventListener('click', async (ev) => {
   const sz = t.closest('[data-snooze]'); if (sz) { ev.preventDefault(); snoozeAlert(sz.dataset.snooze, Number(sz.dataset.days) || 1); bump(); scheduleRender(); const bb = $('#bellBox'); if (bb && deskMod) setTimeout(() => { const b2 = $('#bellBox'); if (b2) b2.classList.remove('hidden'); }, 60); return; }
   const cl = t.closest('[data-cal]'); if (cl && S.desk) { ev.preventDefault(); const bb = $('#bellBox'); if (bb) bb.classList.add('hidden'); go('calendar', 'calendar', { d: cl.dataset.cal, mo: cl.dataset.cal.slice(0, 7) }); return; }
   const wo = t.closest('[data-watchok]'); if (wo) { ev.preventDefault(); const [cid, sc] = wo.dataset.watchok.split('|'); watchCheck(cid, Number(sc)); toast('✓ Checked — hidden for 7 days unless it gets worse'); scheduleRender(); return; }
+  const spk = t.closest('[data-staffpick]'); if (spk) { ev.preventDefault(); staffPick(spk.dataset.staffpick); return; } /* v0.17.0 (3) B2 */
   const om = t.closest('[data-omw]'); if (om) { ev.preventDefault(); const box = document.getElementById('omw_' + om.dataset.omw); if (box) { box.classList.toggle('hidden'); if (!box.classList.contains('hidden')) box.scrollIntoView({ block: 'nearest' }); } return; }
+  const rms = t.closest('[data-rem-sent]'); if (rms) { remMark(rms.dataset.remSent); setTimeout(() => scheduleRender(), 400); } /* the link still opens WhatsApp */
   const oms = t.closest('[data-omw-sent]'); if (oms) { omwMark(oms.dataset.omwSent, oms.dataset.eta); setTimeout(() => { const b = document.getElementById('omw_' + oms.dataset.omwSent); if (b) b.classList.add('hidden'); toast('🛵 Marked "on my way" — it is saved with the visit'); }, 50); return; }
   const apb = t.closest('[data-appr]'); if (apb) { ev.preventDefault(); if (!isApprover()) { toast('Only an approver can do this'); return; }
     const [col, id, st] = apb.dataset.appr.split('|'); const x = S.D[col] && S.D[col].get(id); if (!x || x.approval !== 'Pending') return;
@@ -2850,7 +3137,7 @@ document.addEventListener('click', async (ev) => {
     const g = chip.parentElement; const multi = g.dataset.multi === '1';
     if (multi) chip.classList.toggle('on');
     else { const was = chip.classList.contains('on'); g.querySelectorAll('.chip').forEach((b) => b.classList.remove('on')); if (!was) chip.classList.add('on'); }
-    const f = chip.closest('form'); if (f && f.id === 'theForm') refreshConditional(f);
+    const f = chip.closest('form'); if (f && f.id === 'theForm') { refreshConditional(f); draftSave(f); unconfirm(f); }
     return;
   }
   const lg = t.closest('[data-lang]'); if (lg) { setLang(lg.dataset.lang); render(true); if (S.drawer) refreshDrawer(); if (deskMod) deskMod.paletteClose(); return; }
@@ -2860,9 +3147,15 @@ document.addEventListener('click', async (ev) => {
   const tg = t.closest('[data-tab-go]'); if (tg) { history_.length = 0; go(tg.dataset.tabGo, tg.dataset.tabGo, {}, true); return; }
   const navb = t.closest('nav.tabs button'); if (navb) { history_.length = 0; go(navb.dataset.tab, navb.dataset.tab, {}, true); return; }
   const sideb = t.closest('[data-side]'); if (sideb) { history_.length = 0; closeDrawer(true); go(sideb.dataset.side, sideb.dataset.side, {}, true); return; }
+  const md = t.closest('[data-msdone], [data-msreopen]'); if (md) { /* v0.15 boards */
+    ev.preventDefault(); ev.stopPropagation(); if (!S.isAdmin) return; const done = md.dataset.msdone !== undefined; const id = done ? md.dataset.msdone : md.dataset.msreopen; const x = S.D.milestones.get(id); if (!x) return;
+    auditLog('milestones', id, x, { state: done ? 'Done' : 'Waiting' }); save(`milestones/${id}`, done ? { state: 'Done', doneDate: today() } : { state: 'Waiting', doneDate: '', since: today() }, false); toast(done ? `✅ ${x.title}` : `↩ ${x.title} is open again`); scheduleRender(); return;
+  }
+  const qrm = t.closest('[data-coqr-remove]'); if (qrm) { ev.preventDefault(); if (!S.isAdmin) return; save('settings/app', { coQr: '' }, false); S.settings = { ...S.settings, coQr: '' }; bump(); toast('QR removed'); scheduleRender(); return; }
+  const mx = t.closest('[data-msexport]'); if (mx) { ev.preventDefault(); const b = mx.dataset.msexport; const rows = arr('milestones').filter((x) => !b || (x.board || 'Board') === b).map(({ id, createdAt, updatedAt, createdBy, updatedBy, by, ...rest }) => rest); download(`kora-board-${(b || 'all').replace(/[^\w]+/g, '_')}-${today()}.json`, JSON.stringify(rows, null, 2)); return; }
   const gf = t.closest('[data-go-form]'); if (gf && !canForm(gf.dataset.goForm)) return; // hidden rights stay hidden (no message)
-  if (gf) { ev.preventDefault(); nav(S.route.tab === 'customers' || S.route.screen === 'detail' ? 'customers' : 'new', 'form', { form: gf.dataset.goForm, cid: gf.dataset.cid, id: gf.dataset.id, lead: gf.dataset.lead, kind: gf.dataset.kind, serial: gf.dataset.serial, event: gf.dataset.kind, date: gf.dataset.date, lane: gf.dataset.lane }); return; }
-  const cv = t.closest('[data-convert]'); if (cv) { const l = S.D.leads.get(cv.dataset.convert); S.convertLead = l ? l.id : ''; nav('new', 'form', { form: 'install' }); setTimeout(() => { const f = $('#drawer #theForm') || $('#theForm'); if (f && l) { f.elements.name.value = l.name || ''; f.elements.phone.value = String(l.phone || '').replace('+977', ''); if (l.tole) f.elements.tole.value = l.tole; if (l.ward) f.elements.ward.value = l.ward; if (l.channel) f.elements.referral.value = l.channel; if (l.referrerId && f.elements.referrerId) f.elements.referrerId.value = l.referrerId; refreshConditional(f); } }, 30); return; }
+  if (gf) { ev.preventDefault(); nav(S.route.tab === 'customers' || S.route.screen === 'detail' ? 'customers' : 'new', 'form', { form: gf.dataset.goForm, cid: gf.dataset.cid, id: gf.dataset.id, lead: gf.dataset.lead, kind: gf.dataset.kind, serial: gf.dataset.serial, event: gf.dataset.kind, date: gf.dataset.date, lane: gf.dataset.lane, board: gf.dataset.board }); return; }
+  const cv = t.closest('[data-convert]'); if (cv) { nav('new', 'form', { form: 'install', lead: cv.dataset.convert }); return; } /* v0.11: the install form prefills itself from the lead + its screening */
   const cb = t.closest('button[data-cust]'); if (cb && cb.dataset.cust) { nav('customers', 'detail', { id: cb.dataset.cust }); return; } // a button inside an edit row
   const ed = t.closest('[data-edit]'); if (ed) { nav(S.route.tab, 'form', { form: ed.dataset.edit, id: ed.dataset.id }); return; }
   const rc = t.closest('[data-receipt]'); if (rc) { nav('customers', 'detail', { id: rc.dataset.cid, receipt: rc.dataset.receipt }); return; }
@@ -2879,7 +3172,7 @@ document.addEventListener('click', async (ev) => {
   const rf = t.closest('[data-refcredit]'); if (rf) {
     ev.preventDefault(); if (!isBoss()) { toast('Only admin applies credits'); return; }
     const [cid, forId] = rf.dataset.refcredit.split('|');
-    save(`payments/${newId('payments')}`, { customerId: cid, date: today(), type: 'Referral credit', amount: R.PRICES.monthly, referralFor: forId, method: '', notes: 'Referral reward (G-1 §4)', by: myName() }, true);
+    save(`payments/${newId('payments')}`, { customerId: cid, date: today(), type: 'Referral credit', amount: R.referralAmount(), referralFor: forId, method: '', notes: 'Referral reward', by: myName() }, true);
     toast('🎁 Referral credit applied'); scheduleRender(); return;
   }
   if (t.closest('[data-back]')) { backClick(); return; }
@@ -2890,6 +3183,13 @@ document.addEventListener('click', async (ev) => {
   if (t.closest('#viewer')) { $('#viewer').style.display = 'none'; return; }
   const stg = t.closest('.staff [data-perm], .staff [data-area]'); if (stg) { stg.classList.toggle('on'); const ck = stg.querySelector('.ck'); if (ck) ck.textContent = stg.classList.contains('on') ? '✓' : ''; const card = stg.closest('.staff'); if (stg.dataset.perm) card.querySelectorAll('[data-preset]').forEach((b) => b.classList.remove('on')); return; }
   const pz = t.closest('.staff [data-preset]'); if (pz) { const card = pz.closest('.staff'); const pr = PRESETS[pz.dataset.preset].perms; card.querySelectorAll('[data-preset]').forEach((b) => b.classList.toggle('on', b === pz)); card.querySelectorAll('[data-perm]').forEach((b) => { const on = !!pr[b.dataset.perm]; b.classList.toggle('on', on); b.querySelector('.ck').textContent = on ? '✓' : ''; }); return; }
+  const my = t.closest('[data-mysave]'); if (my) { /* v0.16 #3 */
+    const card = my.closest('.staff'); const d = { fullName: card.querySelector('[data-ufull]').value.trim().slice(0, 80) }; if (card.dataset.photo) d.photo = card.dataset.photo;
+    if (S.isAdmin) d.name = myName(); /* other phones find the admin's card by the name on the visit */
+    try { if (!DEMO) await setDoc(doc(db, 'users', S.user.uid), d, { merge: true }); /* no stamps: staff may change only fullName / photo on their own doc */
+      S.profile = { ...(S.profile || {}), ...d }; lsSet('kf_prof_' + S.user.uid, S.profile); toast('✅ Your card is saved'); loadUsers(); } catch (e) { toast('Failed: ' + (e.code || e.message)); }
+    return;
+  }
   const ss = t.closest('[data-staffsave]'); if (ss) {
     const uid = ss.dataset.staffsave; const card = ss.closest('.staff'); const d = readStaffCard(card);
     if (!d.name) { toast('Write their name first'); card.querySelector('[data-uname]').focus(); return; }
@@ -2922,6 +3222,18 @@ document.addEventListener('click', async (ev) => {
   const a = t.closest('[data-act]'); if (!a) return;
   const act = a.dataset.act;
   if (act === 'closeDrawer') closeDrawer();
+  else if (act === 'drawerFull') { const dr = $('#drawer'); if (dr) { dr.classList.toggle('full'); if (dr.classList.contains('full')) dr.classList.remove('wide'); else if (S.drawer && ['list', 'report'].includes(S.drawer.screen)) dr.classList.add('wide'); } } /* v0.15 */
+  else if (act === 'memoToggle') { ev.preventDefault(); const b = $('#memoBox'); if (!b) return; b.classList.toggle('hidden'); lsSet('kf_memo_open', b.classList.contains('hidden') ? 0 : 1); if (!b.classList.contains('hidden')) { const ta = $('#memoTa'); if (ta) ta.focus(); } }
+  else if (act === 'rcImg') { ev.preventDefault(); imageCard('receipt', a.dataset.pid); }
+  else if (act === 'rcRef') { ev.preventDefault(); imageCard('referral', a.dataset.cid); }
+  else if (act === 'rcVisit') { ev.preventDefault(); imageCard('visit', a.dataset.vid); }
+  else if (act === 'rcInst') { ev.preventDefault(); imageCard('install', a.dataset.cid); }
+  else if (act === 'rcBill') { ev.preventDefault(); ev.stopPropagation(); const cid = a.dataset.cid; if ($('#rcBox')) imageCard('bill', cid); else { nav('customers', 'detail', { id: cid }); setTimeout(() => imageCard('bill', cid), 450); } } /* v0.16 #7: from a list → open the home, then draw */
+  else if (act === 'rcShare') { ev.preventDefault(); if (!S.rcBlob) return; const r = await RC.shareImage(S.rcBlob, S.rcName || 'receipt.png'); toast(r === 'shared' ? '✅ Shared' : r === 'unsupported' ? 'Sharing not available here — save the image' : 'Share cancelled'); }
+  else if (act === 'rcWaWeb') { ev.preventDefault(); if (!S.rcUrl) return; const w = waWebOpen(S.rcPhone); const dl = document.createElement('a'); dl.href = S.rcUrl; dl.download = S.rcName || 'kora-card.png'; document.body.appendChild(dl); dl.click(); dl.remove(); toast(!w ? 'Pop-up blocked — allow pop-ups for this site, then tap again' : DEMO ? 'Practice: made-up numbers, so no chat was opened' : '⬇️ Saved · drag the picture into the chat'); } /* v0.16.0 (5) ④ */
+  else if (act === 'cardOpen') { ev.preventDefault(); const k = a.dataset.kind, id = a.dataset.id, cid = a.dataset.cid; if (!k || !id || !cid) return; nav('customers', 'detail', k === 'receipt' ? { id: cid, receipt: id } : k === 'visit' ? { id: cid, vrep: id } : { id: cid, inst: cid }); setTimeout(() => imageCard(k, id), 450); } /* ⑥ from the desk list: the home opens with the card drawn */
+  else if (act === 'cardsMore') { ev.preventDefault(); const L = document.querySelector('.cs-list'); if (L) { L.classList.add('cs-open'); csLayout(); } } /* v0.16.0 (7) */
+  else if (act === 'cardSent') { ev.preventDefault(); const k = a.dataset.key; if (!k) return; const on = markCardSent(k, !cardsSent()[k]); syncSentUi(k, on); toast(on ? '✓ Marked as sent' : 'Marked as not sent'); } /* ⑥ */
   else if (act === 'demoWho') { if (DEMO) demoWho(); }
   else if (act === 'demoAs') { if (DEMO) demoAs(a.dataset.as || ''); }
   else if (act === 'demoReset') { if (!DEMO || !DEMO_KEEP) return; if (a.dataset.armed !== '1') { a.dataset.armed = '1'; a.textContent = 'Tap again — delete every practice record'; a.classList.add('danger'); return; } location.href = location.pathname + '?reset=1'; }
@@ -2956,16 +3268,19 @@ document.addEventListener('click', async (ev) => {
   } else if (act === 'roleRefresh') { if (S.wiped) { location.reload(); return; } await refreshRole(); if (S.role === 'staff') await startData(false); render(); }
   else if (act === 'signOut') {
     const n = myJournal().filter((e) => e.state === 'pending').length;
-    if (n && a.dataset.sure !== '1') { a.dataset.sure = '1'; a.textContent = `⚠️ ${n} record(s) not sent yet — tap again to sign out anyway`; return; }
+    if (n && a.dataset.sure !== '1') { a.dataset.sure = '1'; a.textContent = `⚠️ ${n} record(s) not sent yet — they will be deleted from this phone. Tap again to sign out anyway`; return; }
     if (DEMO) { toast('Demo mode'); return; }
     // signing out also removes the company data kept on this device (cache, journal, photos) — a shared phone keeps nothing
     await wipePhone(); await signOut(auth); location.reload();
-  } else if (act === 'sync') { toast('Checking…'); await reconcile(true); toast(syncState().t); }
+  } else if (act === 'draftClear') { const f = a.closest('form'); if (f) { draftClear(f.dataset.form); if (S.drawer) refreshDrawer(); else render(false); toast('Draft removed'); } }
+  else if (act === 'gpsHere') { gpsHere(a.dataset.cid, a); }
+  else if (act === 'photosNet') { a.disabled = true; a.textContent = 'Loading…'; loadPhotos(a.dataset.cid, '', true).then(() => { a.textContent = 'Loaded'; }); }
+  else if (act === 'moreLinks') { const m = $('#moreLinks'); if (m) { m.classList.toggle('hidden'); a.textContent = m.classList.contains('hidden') ? '⋯ More' : '⋯ Less'; } }
+  else if (act === 'sync') { toast('Checking…'); await reconcile(true); toast(syncState().t); }
   else if (act === 'full') { if (navigator.onLine && !DEMO) { await startData(true); toast('Reloading from server…'); } else toast('Needs internet'); }
   else if (act === 'persist') { let r = false; try { r = await navigator.storage.persist(); } catch (e) {} toast('Storage protection: ' + (r ? 'ON' : 'not granted')); fillDiag(); }
   else if (act === 'swReload' && S.swWaiting) S.swWaiting.postMessage('skipWaiting');
   else if (act === 'privSave') { const ok = save(`customers/${a.dataset.cid}/private/main`, { notes: ($('#drawer #privNotes') || $('#privNotes')).value.trim() }, false); toast(ok ? 'Private notes saved' : '🔴 Could not save on phone'); }
-  else if (act === 'pickRandom') pickRandomCalls();
   else if (act === 'theme') { const k = 'kf_theme_' + (S.desk ? 'desk' : 'phone'); const nx = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark'; lsSet(k, nx); render(true); }
   else if (act === 'deskOn') { lsSet('kf_desk', true); S.route = { tab: 'command', screen: 'command', params: {} }; render(true); }
   else if (act === 'deskOff') { lsSet('kf_desk', false); closeDrawer(true); S.route = { tab: 'today', screen: 'today', params: {} }; render(true); }
@@ -2991,14 +3306,43 @@ document.addEventListener('change', (ev) => {
   if (ev.target.classList.contains('photoIn')) { addFormPhotos([...ev.target.files]); ev.target.value = ''; return; }
   if (ev.target.id === 'bankFile' && ev.target.files[0]) { bankUpload(ev.target.files[0]); return; }
   if (ev.target.id === 'bkCheck' && ev.target.files[0]) { checkBackupFile(ev.target.files[0]); return; }
+  if (ev.target.id === 'msImport' && ev.target.files[0]) { /* v0.15: a board from a JSON file (the real items are kept outside the public code) */
+    const file = ev.target.files[0]; ev.target.value = ''; if (!S.isAdmin) return;
+    const rd = new FileReader(); rd.onload = () => { try {
+      const j = JSON.parse(rd.result); const rows = Array.isArray(j) ? j : Array.isArray(j.items) ? j.items : []; const have = new Set(arr('milestones').map((x) => `${x.board}|${x.title}`)); let n = 0, skip = 0;
+      for (const r0 of rows) { const r = { board: String(r0.board || '').trim().slice(0, 60), title: String(r0.title || '').trim().slice(0, 160), who: MS_WHO.includes(r0.who) ? r0.who : 'Other', whoName: String(r0.whoName || '').slice(0, 80), state: MS_STATE.includes(r0.state) ? r0.state : 'Todo', since: R.isDate(r0.since) ? r0.since : '', due: R.isDate(r0.due) ? r0.due : '', grade: MS_GRADE.includes(r0.grade) ? r0.grade : MS_GRADE[2], src: String(r0.src || '').slice(0, 300), note: String(r0.note || '').slice(0, 600), order: Number(r0.order) || 0, doneDate: R.isDate(r0.doneDate) ? r0.doneDate : '', by: myName() };
+        if (!r.board || !r.title) { skip++; continue; } if (have.has(`${r.board}|${r.title}`)) { skip++; continue; } have.add(`${r.board}|${r.title}`); save(`milestones/${newId('milestones')}`, r, true); n++; }
+      toast(`📥 ${n} item(s) added${skip ? ` · ${skip} skipped (empty or already there)` : ''}`); scheduleRender();
+    } catch (e) { toast('Not a board file: ' + (e.message || e)); } }; rd.readAsText(file); return;
+  }
+  if (ev.target.id === 'coQrIn' && ev.target.files[0]) { /* v0.16 #7: the company QR → 320px square PNG in settings/app.coQr */
+    const file = ev.target.files[0]; ev.target.value = ''; if (!S.isAdmin) { toast('Only Jun changes settings'); return; }
+    shrinkQr(file).then((url) => { save('settings/app', { coQr: url }, false); S.settings = { ...S.settings, coQr: url }; bump(); toast('✅ QR saved — it goes on the bill card'); scheduleRender(); }).catch((e) => toast('Cannot read this picture: ' + (e.message || e)));
+    return;
+  }
+  if (ev.target.dataset && ev.target.dataset.uphoto !== undefined && ev.target.files[0]) { /* v0.15: staff photo → 160px square → saved with the rights card */
+    const card = ev.target.closest('.staff'); const file = ev.target.files[0]; ev.target.value = '';
+    shrinkAvatar(file).then((url) => { card.dataset.photo = url; const av = card.querySelector('[data-uav]'); if (av) av.innerHTML = `<img src="${esc(url)}" alt="">`; toast('Photo ready — press Save rights to keep it'); }).catch((e) => toast('Cannot read this photo: ' + (e.message || e)));
+    return;
+  }
   const as = ev.target.closest && ev.target.closest('[data-assign]'); if (as && isBoss()) { save(`customers/${as.dataset.assign}`, { assignee: as.value, cover: null }, false); toast(as.value ? `👤 Now goes to ${as.value}` : '👤 Nobody assigned'); scheduleRender(); return; }
-  const f = ev.target.closest && ev.target.closest('#theForm'); if (f) refreshConditional(f);
+  const f = ev.target.closest && ev.target.closest('#theForm'); if (f) { refreshConditional(f); draftSave(f); unconfirm(f); }
 });
 document.addEventListener('input', (ev) => {
   if (ev.target.id === 'custSearch') { S.route.params.q = ev.target.value; const l = $('#custList'); if (l) l.innerHTML = custListHtml(S.route.params); return; }
   if (ev.target.id === 'deskSearch' && deskMod) { deskMod.onSearch(ev.target.value); return; }
-  const f = ev.target.closest && ev.target.closest('#theForm'); if (f && ev.target.tagName === 'SELECT') refreshConditional(f);
+  const f = ev.target.closest && ev.target.closest('#theForm'); if (f) { if (ev.target.tagName === 'SELECT') refreshConditional(f); draftSave(f); unconfirm(f); }
+  const cp = ev.target.classList && ev.target.classList.contains('custpick') ? ev.target : null; if (cp) custPickFilter(cp);
 });
+// v0.11.1 (#6): once a value changes, the yellow notes must be checked again — "Save anyway" goes back to "Save"
+// v0.11.1 (#8): the search box rebuilds the customer wheel with matches only (the chosen one stays)
+function custPickFilter(inp) {
+  const sel = document.getElementById(inp.dataset.for); if (!sel) return; const q = inp.value.trim().toLowerCase(); const cur = sel.value;
+  const list = arr('customers').filter((c) => (c.status !== 'Churned' || c.id === cur) && (!q || [c.name, c.code, c.phone, toleOf(c)].some((s) => String(s || '').toLowerCase().includes(q)))).sort((a, b) => String(a.name).localeCompare(String(b.name))).slice(0, q ? 40 : 2000);
+  sel.innerHTML = `<option value="">— choose customer —</option>${list.map((c) => `<option value="${esc(c.id)}"${c.id === cur ? ' selected' : ''}>${esc(custLabel(c))} · ${esc(toleOf(c))}</option>`).join('')}`;
+  if (q && list.length === 1) { sel.value = list[0].id; const f = sel.closest('form'); if (f) refreshConditional(f); }
+}
+function unconfirm(f) { if (f.dataset.confirmed === '1') { delete f.dataset.confirmed; const b = f.querySelector('#saveBtn'); if (b) b.textContent = 'Save'; } }
 document.addEventListener('submit', async (ev) => {
   ev.preventDefault(); const f = ev.target;
   if (f.id === 'loginForm') {
@@ -3018,8 +3362,8 @@ document.addEventListener('submit', async (ev) => {
     if (!S.isAdmin) { toast('Only Jun changes settings'); return; }
     const e = f.elements; const pan = e.coPan.value.replace(/\s/g, '');
     if (pan && !/^\d{9}$/.test(pan)) { toast('Company PAN has 9 digits'); return; }
-    const data = { leadTimeWeeks: Number(e.leadTimeWeeks.value) || R.FCL.leadTimeWeeks, techNames: e.techNames.value.trim(), holidays: e.holidays.value.trim(), coName: e.coName.value.trim(), coPan: pan, coAddress: e.coAddress.value.trim(), bsOverride: e.bsOverride.value.trim(), payday: e.payday.value.trim(), payroll: e.payroll.value, filterLeadWeeks: e.filterLeadWeeks.value.trim(), filterSafetyWeeks: e.filterSafetyWeeks.value.trim(), filterCoverMonths: e.filterCoverMonths.value.trim(), capPeople: e.capPeople.value.trim(), capJobsPerDay: e.capJobsPerDay.value.trim(), capInstallSlots: e.capInstallSlots.value.trim(), hireLeadWeeks: e.hireLeadWeeks.value.trim(), callbackDays: e.callbackDays.value.trim(), promiseMaxDays: e.promiseMaxDays.value.trim(), screenWarn: e.screenWarn.value, signAsk: e.signAsk.value, partsList: e.partsList.value.trim().slice(0, 2000), partsMin: e.partsMin.value.trim(), vialTarget: e.vialTarget.value.trim(), handoverContacts: e.handoverContacts.value.trim().slice(0, 2000), taxTable: e.taxTable.value.trim().slice(0, 1000), handoverNotes: e.handoverNotes.value.trim().slice(0, 2000), omwEn: e.omwEn.value.trim().slice(0, 600), omwNe: e.omwNe.value.trim().slice(0, 600), missEn: e.missEn.value.trim().slice(0, 600), missNe: e.missNe.value.trim().slice(0, 600),
-      apprDiscountOver: e.apprDiscountOver.value.trim() === '' ? null : Math.max(0, Number(e.apprDiscountOver.value) || 0), apprRefundOver: e.apprRefundOver.value.trim() === '' ? null : Math.max(0, Number(e.apprRefundOver.value) || 0), apprWho: e.apprWho.value }; // numbers: the rules compare them
+    const data = { leadTimeWeeks: Number(e.leadTimeWeeks.value) || R.FCL.leadTimeWeeks, techNames: e.techNames.value.trim(), holidays: e.holidays.value.trim(), coName: e.coName.value.trim(), coPan: pan, coAddress: e.coAddress.value.trim(), coPhone: e.coPhone.value.trim().slice(0, 40), coNameNe: e.coNameNe.value.trim().slice(0, 80), coBankLine: e.coBankLine.value.trim().slice(0, 120), referralCampaign: e.referralCampaign.value, filterMode: e.filterMode.value, bsOverride: e.bsOverride.value.trim(), payday: e.payday.value.trim(), payroll: e.payroll.value, filterLeadWeeks: e.filterLeadWeeks.value.trim(), filterSafetyWeeks: e.filterSafetyWeeks.value.trim(), filterCoverMonths: e.filterCoverMonths.value.trim(), capPeople: e.capPeople.value.trim(), capJobsPerDay: e.capJobsPerDay.value.trim(), capInstallSlots: e.capInstallSlots.value.trim(), hireLeadWeeks: e.hireLeadWeeks.value.trim(), callbackDays: e.callbackDays.value.trim(), promiseMaxDays: e.promiseMaxDays.value.trim(), screenWarn: e.screenWarn.value, signAsk: e.signAsk.value, partsList: e.partsList.value.trim().slice(0, 2000), partsMin: e.partsMin.value.trim(), vialTarget: e.vialTarget.value.trim(), learnFilters: e.learnFilters.value, handoverContacts: e.handoverContacts.value.trim().slice(0, 2000), taxTable: e.taxTable.value.trim().slice(0, 1000), handoverNotes: e.handoverNotes.value.trim().slice(0, 2000), omwEn: e.omwEn.value.trim().slice(0, 600), omwNe: e.omwNe.value.trim().slice(0, 600), missEn: e.missEn.value.trim().slice(0, 600), missNe: e.missNe.value.trim().slice(0, 600),
+      apprDiscountOver: e.apprDiscountOver.value.trim() === '' ? null : Math.max(0, Number(e.apprDiscountOver.value) || 0), apprRefundOver: e.apprRefundOver.value.trim() === '' ? null : Math.max(0, Number(e.apprRefundOver.value) || 0), apprWho: e.apprWho.value, visitLines: e.visitLines.value.trim().slice(0, 2000) }; // numbers: the rules compare them
     auditLog('settings', 'app', S.settings, data); save('settings/app', data, false); S.settings = { ...S.settings, ...data }; B.setOverrides(data.bsOverride); bump(); toast('Settings saved'); goBack();
   }
 });
@@ -3028,6 +3372,16 @@ document.addEventListener('keydown', (ev) => {
   if (document.getElementById('peek')) { closePeek(); return; }
   if (S.drawer) closeDrawer();
 });
+// v0.11.1 (#4): a technician at the door saves the pin without the edit right (rules already allow the gps field for the visit right)
+function gpsHere(cid, btn) {
+  if (!navigator.geolocation) { toast('This phone cannot give location'); return; }
+  if (btn) btn.textContent = 'Getting location…';
+  navigator.geolocation.getCurrentPosition((p) => {
+    const acc = Math.round(p.coords.accuracy); if (acc > 150 && btn && btn.dataset.sure !== '1') { btn.dataset.sure = '1'; btn.textContent = `±${acc} m — stand outside and tap again to save anyway`; return; }
+    save(`customers/${cid}`, { gps: { lat: Number(p.coords.latitude.toFixed(6)), lng: Number(p.coords.longitude.toFixed(6)), acc } }, false);
+    toast(`📍 Location saved (±${acc} m)`); if (S.drawer) refreshDrawer(); else scheduleRender();
+  }, (e) => { toast('Could not get location: ' + e.message); if (btn) btn.textContent = '📍 Save my location as this house'; }, { enableHighAccuracy: true, timeout: 25000, maximumAge: 0 });
+}
 function captureGps(form) {
   const out = form.querySelector('#gpsOut');
   if (!navigator.geolocation) { out.textContent = 'This phone cannot give location.'; return; }
@@ -3061,7 +3415,7 @@ if ('serviceWorker' in navigator && !DEMO) {
 initLang(DEMO ? (new URLSearchParams(location.search).get('lang') || 'en') : 'en');
 if (DEMO && new URLSearchParams(location.search).get('lang')) setLang(new URLSearchParams(location.search).get('lang'), false);
 // v0.10.1 (Jun 2026-09-29 "쉽게 버튼을"): demo / practice — switch who you are with the 👤 button, no link to type
-const DEMO_WHO = { '': ['👑', 'Jun', 'Admin — everything'], office: ['⭐', 'Tara', 'Deputy admin · office — every home, money OKs, service credits (not the settings)'], technician: ['🔧', 'Ramesh', 'Technician — only his homes and today\'s route · visits, installs, cash'] };
+const DEMO_WHO = { '': ['👑', 'Jun', 'Admin — everything'], office: ['⭐', 'Tara', 'Deputy admin · office — every home, money OKs, service credits (not the settings)'], technician: ['🔧', 'Laxmi', 'Technician — only her homes and today\'s route · visits, installs, cash'] };
 function demoWho() {
   const cur = S.isAdmin ? '' : (S.profile && S.profile.preset) || '';
   peek(`<h3>👤 Practise as</h3><div class="muted">One set of data for all three — what one saves, the others see (like the real server).</div>
@@ -3075,14 +3429,14 @@ function demoAs(as) {
 if (DEMO) {
   S.user = { uid: 'demo-uid', email: 'demo@local' }; S.isAdmin = true; S.role = 'admin';
   const asRole = new URLSearchParams(location.search).get('as') || (DEMO_KEEP ? lsGet('kf_demo_as', '') : ''); // ?as=technician|office|viewer → see the app as that staff member (or the 👤 button)
-  if (asRole && PRESETS[asRole]) { S.isAdmin = false; S.role = 'staff'; S.profile = { name: asRole === 'office' ? 'Tara' : asRole === 'technician' ? 'Ramesh' : 'Viewer', preset: asRole, perms: { ...PRESETS[asRole].perms, ...(asRole === 'technician' ? { seeAll: 0 } : {}) }, toles: asRole === 'technician' ? ['Lakeside', 'Baidam'] : [] };
+  if (asRole && PRESETS[asRole]) { S.isAdmin = false; S.role = 'staff'; S.profile = { name: asRole === 'office' ? 'Tara' : asRole === 'technician' ? 'Laxmi' : 'Viewer', preset: asRole, perms: { ...PRESETS[asRole].perms, ...(asRole === 'technician' ? { seeAll: 0 } : {}) }, toles: asRole === 'technician' ? ['Lakeside', 'Baidam'] : [] };
     // v0.10.1: signed in as that person's own account (what they save carries their id) · Tara = the deputy admin (Jun 2026-09-29)
-    S.user = { uid: asRole === 'office' ? 'demo-tara' : asRole === 'technician' ? 'demo-ram' : 'demo-viewer', email: asRole === 'office' ? 'tara@example.com' : asRole === 'technician' ? 'ramesh@example.com' : 'viewer@example.com' };
+    S.user = { uid: asRole === 'office' ? 'demo-tara' : asRole === 'technician' ? 'demo-ram' : 'demo-viewer', email: asRole === 'office' ? 'tara@example.com' : asRole === 'technician' ? 'laxmi@example.com' : 'viewer@example.com' };
     if (asRole === 'office') { S.profile.deputy = true; S.isDeputy = true; } }
-  window.__kf = { S, jLoad, syncState, go, nav, addFormPhotos, photoGet, model, closeDrawer, FORMS, render, setLang, getLang, G, CA, B, can, PRESETS, R , CAL, liveAlerts, techNames, closePeek, save};
+  window.__kf = { S, jLoad, syncState, go, nav, addFormPhotos, photoGet, model, closeDrawer, FORMS, render, setLang, getLang, G, CA, B, can, PRESETS, R , CAL, liveAlerts, techNames, closePeek, save, rcCacheKeys, waWebUrl, msBoards };
   const who = DEMO_WHO[asRole && PRESETS[asRole] ? asRole : ''] || DEMO_WHO[''];
   const flag = document.createElement('button'); flag.type = 'button'; flag.className = 'demo-flag'; flag.dataset.act = 'demoWho'; flag.title = 'Change who you are';
-  flag.innerHTML = `<span>${DEMO_LABEL}</span> · ${who[0]} ${who[1]} ▾`; document.body.appendChild(flag);
+  flag.innerHTML = `<span>${DEMO_LABEL}</span> · ${who[0]} ${who[1]} ▾`; document.body.appendChild(flag); document.body.classList.add('has-flag'); /* v0.11: the page starts below the badge */
   if (!location.search.includes('empty')) import('./demo.js').then((d) => { d.loadDemo(S, today()); bump(); heartbeat(true); render(true); }).catch((e) => console.warn('demo', e));
 }
 render(true);

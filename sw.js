@@ -1,8 +1,8 @@
 // KORA Field — service worker: keeps the app itself on the phone so it opens with no internet.
 // Data does not go through here (Firestore talks to Google directly and keeps its own offline copy).
-const VERSION = 'kf-v0.10.2';
-const SHELL = ['./', './index.html', './app.js', './logic.js', './desk.js', './route.js', './i18n.js', './geo.js', './bs.js', './capack.js', './cal.js', './sim.js', './styles.css', './manifest.webmanifest', './icon-180.png', './icon-512.png',
-  './vendor/firebase-app.js', './vendor/firebase-auth.js', './vendor/firebase-firestore.js', './vendor/leaflet/leaflet.js', './vendor/leaflet/leaflet.css'];
+const VERSION = 'kf-v0.17.1';
+const SHELL = ['./', './index.html', './app.js', './logic.js', './desk.js', './route.js', './i18n.js', './geo.js', './bs.js', './capack.js', './cal.js', './sim.js', './receipt.js', './logo.png', './styles.css', './manifest.webmanifest', './icon-180.png', './icon-512.png',
+  './vendor/firebase-app.js', './vendor/firebase-auth.js', './vendor/firebase-firestore.js', './vendor/leaflet/leaflet.js', './vendor/leaflet/leaflet.css', './vendor/osm-pokhara-wards.json'];
 
 self.addEventListener('install', (e) => {
   // cache:'reload' skips the browser HTTP cache so a new version really downloads new files
